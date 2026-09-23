@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, for the Frappe `develop` job below. See the matrix comment.
+    - cron: "0 6 * * 1"
+
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -39,12 +43,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `develop` is the next Frappe major before it is released. It is allowed to fail:
-        # its job is to tell us a coming release has broken us while there is still time to
-        # do something about it, not to block a pull request on someone else's work in
-        # progress. `frappe.db.savepoint` is the cautionary tale -- an API used wrongly, its
-        # exception swallowed, and every Item Tax Template silently not created.
-        frappe-branch: [version-15, develop]
+        # `develop` is the next Frappe major before it is released. Its job is to tell us a
+        # coming release has broken us while there is still time to do something about it --
+        # `frappe.db.savepoint` is the cautionary tale: an API used wrongly, its exception
+        # swallowed, and every Item Tax Template silently not created.
+        #
+        # It runs weekly, not on every push, and never blocks. `develop` breaks its own
+        # `bench init` often enough that a red check on every commit would just teach everyone
+        # to ignore the one signal this job exists to give.
+        frappe-branch: ${{ github.event_name == 'schedule' && fromJSON('["version-15","develop"]') || fromJSON('["version-15"]') }}
 
     continue-on-error: ${{ matrix.frappe-branch == 'develop' }}
 
