@@ -122,13 +122,12 @@ Not built: buyer GSTIN for B2B (Shopify does not collect it), and e-Invoice / IR
 
 | | |
 |---|---|
-| **[docs/prerequisites.md](docs/prerequisites.md)** | **Start here.** What to set up in Shopify, then in ERPNext, in order |
-| [docs/how-it-works.md](docs/how-it-works.md) | The whole flow, and the things that will bite you |
-| [docs/operations.md](docs/operations.md) | Running it day to day |
-| [docs/test-plan.md](docs/test-plan.md) | What has been verified end to end, and how |
-| [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) | Contributing, and reporting a vulnerability |
+| **[docs/prerequisites.md](docs/prerequisites.md)** | **Start here.** What to set up in Shopify, then in ERPNext, in order — plus the traps, and what is not built |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Running the tests, and what a good change looks like |
+| [SECURITY.md](SECURITY.md) | The security model, and how to report a vulnerability |
 
-[The build specification](shopify-integration-spec.md) records the original plan.
+[The build specification](shopify-integration-spec.md) records the original plan and the
+reasoning behind the architecture.
 
 ## Importing a catalogue
 

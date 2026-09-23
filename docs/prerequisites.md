@@ -321,11 +321,21 @@ recorded there with its status and, when it failed, the full error.
 
 ---
 
-## What is not built
+## What is not built, and what is not proven
 
-Be aware before you rely on it:
+Be aware before you rely on it.
 
-* **Buyer GSTIN for B2B** — Shopify does not collect it, so B2B invoices carry no customer GSTIN
+**Not built:**
+
+* **Buyer GSTIN for B2B** — Shopify does not collect it, so B2B invoices file as B2C
 * **e-Invoice / IRN / e-Way Bill** — not handled
 * **Shopify tax settings** cannot be configured from ERPNext. Shopify exposes no API for them;
-  they must be set in the Shopify admin.
+  they must be set in the Shopify admin
+
+**Built, but not proven at scale:**
+
+* **Load and concurrency.** Everything has been exercised one operation at a time. The queue is
+  built for concurrent workers and the claim uses `FOR UPDATE SKIP LOCKED`, but it has not been
+  run under real parallel load.
+* **A very large catalogue.** The bulk importer is written for 50,000 products and has been
+  tested on a handful.
