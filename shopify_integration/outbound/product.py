@@ -19,8 +19,10 @@ inbound writer did not mark its saves.
 
 from __future__ import annotations
 
+from urllib.parse import quote, urlparse
+
 import frappe
-from frappe.utils import cstr
+from frappe.utils import cstr, get_url
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import is_echo
@@ -199,6 +201,7 @@ def push_products(store: str, rows: list[dict]) -> None:
 			payload["descriptionHtml"] = cstr(item.description or "")
 
 		client.execute(load_query("product_update"), {"product": payload}, cost_hint=10)
+		_sync_image(client, link.product_gid, item)
 
 
 # --------------------------------------------------------------------------------------
@@ -235,12 +238,23 @@ def _create_product(client: ShopifyClient, store: str, item_code: str) -> str | 
 
 	options = _options_from(children) if children else []
 
+	# A product with no price anywhere must not go live. Shopify starts a new variant at 0.00,
+	# so publishing it ACTIVE puts a free saree in the shop -- worse than not publishing at
+	# all, and nothing in Shopify flags it. Draft keeps the mapping, the SKU and the inventory
+	# link, and leaves the merchant to price it and hit Activate.
+	price = _selling_price(item_code, store_doc)
+	if price is None:
+		frappe.logger("shopify_integration").info(
+			f"Publishing {item_code} to {store} as DRAFT: no selling price on "
+			f"'{store_doc.selling_price_list}' and no standard rate on the Item."
+		)
+
 	payload = {
 		"title": cstr(item.item_name or item_code)[:255],
 		"descriptionHtml": cstr(item.description or ""),
 		"productType": cstr(item.item_group or "")[:255],
 		"vendor": cstr(item.get("brand") or "")[:255] or None,
-		"status": "ARCHIVED" if item.disabled else "ACTIVE",
+		"status": "ARCHIVED" if item.disabled else ("ACTIVE" if price is not None else "DRAFT"),
 	}
 	if options:
 		payload["productOptions"] = options
@@ -256,6 +270,8 @@ def _create_product(client: ShopifyClient, store: str, item_code: str) -> str | 
 		variants = (product.get("variants") or {}).get("nodes") or []
 		if variants:
 			_fill_variant(client, product["id"], variants[0]["id"], item, store_doc)
+
+	_sync_image(client, product["id"], item)
 
 	# Re-read: SKUs, prices and inventory items only exist after the second call, and a link
 	# without the inventory item id cannot push stock.
@@ -288,6 +304,70 @@ def _fill_variant(client: ShopifyClient, product_gid: str, variant_gid: str, ite
 		{"productId": product_gid, "variants": [variant]},
 		cost_hint=15,
 	)
+
+
+def item_image_url(item) -> str | None:
+	"""An absolute, publicly fetchable URL for the item's image, or None.
+
+	Shopify fetches the image itself rather than accepting an upload here, so the URL has to be
+	reachable from the internet. Three things make that fail, and each is worth saying out loud
+	rather than failing silently:
+
+	* the Item has no image at all;
+	* the file is private -- Frappe serves those only to a logged-in session, so Shopify gets
+	  a redirect to the login page and stores that as the product photo;
+	* the site is only on localhost, so there is nothing for Shopify to fetch.
+	"""
+	image = cstr(item.get("image")).strip()
+	if not image:
+		return None
+
+	if image.startswith(("http://", "https://")):
+		return image
+
+	if frappe.db.exists("File", {"file_url": image, "is_private": 1}):
+		frappe.logger("shopify_integration").info(
+			f"Not sending {item.name}'s image to Shopify: {image} is a private file, and "
+			f"Shopify has no session to fetch it with. Re-upload it unticked as private."
+		)
+		return None
+
+	base = cstr(get_url()).rstrip("/")
+	host = urlparse(base).hostname or ""
+	if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost"):
+		frappe.logger("shopify_integration").info(
+			f"Not sending {item.name}'s image to Shopify: this site is {base}, which Shopify "
+			f"cannot reach. Set host_name in site_config to a public URL."
+		)
+		return None
+
+	# The path is already URL-ish but filenames routinely carry spaces and commas.
+	return base + quote(image, safe="/:@&=+$,-_.!~*'()")
+
+
+def _sync_image(client: ShopifyClient, product_gid: str, item) -> None:
+	"""Attach the ERPNext item's image to the Shopify product, once.
+
+	Only when the product has no image yet. Shopify's media list is the merchant's -- they may
+	have added better photography there, and replacing it on every save would be the storefront
+	copy problem all over again.
+	"""
+	url = item_image_url(item)
+	if not url:
+		return
+
+	existing = client.execute(load_query("product_media"), {"id": product_gid}, cost_hint=5)
+	if ((existing.get("product") or {}).get("media") or {}).get("nodes"):
+		return
+
+	result = client.execute(
+		load_query("product_create_media"),
+		{"productId": product_gid, "media": [{"originalSource": url, "mediaContentType": "IMAGE"}]},
+		cost_hint=10,
+	)
+	errors = (result.get("productCreateMedia") or {}).get("mediaUserErrors") or []
+	if errors:
+		frappe.logger("shopify_integration").warning(f"Shopify refused {item.name}'s image ({url}): {errors}")
 
 
 def _selling_price(item_code: str, store_doc):

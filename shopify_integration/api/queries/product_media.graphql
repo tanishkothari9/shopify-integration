@@ -1,0 +1,16 @@
+# What images a product already has, so the same one is not attached twice.
+query ProductMedia($id: ID!) {
+  product(id: $id) {
+    id
+    media(first: 20) {
+      nodes {
+        ... on MediaImage {
+          id
+          image {
+            url
+          }
+        }
+      }
+    }
+  }
+}

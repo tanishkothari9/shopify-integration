@@ -21,6 +21,34 @@ from shopify_integration.sync.engine import enqueue_sync
 from shopify_integration.utils.money import from_document, quantize
 
 
+def on_item_change(doc, method=None):
+	"""doc_event on Item. Queues a price push when the Item itself carries the price.
+
+	`current_price` falls back to the Item's Standard Selling Rate, because that is where
+	ERPNext puts a rate typed on the Item form unless the store's own price list happens to be
+	the one in Selling Settings. If only Item Price changes queued a push, that rate would be
+	readable and never sent: the product sat in Shopify at 0.00 while ERPNext showed 1,200.
+	"""
+	if is_echo(doc):
+		return
+
+	item_code = doc.name
+	for store in frappe.get_all(
+		"Shopify Item Link", filters={"item_code": item_code}, pluck="store", distinct=True
+	):
+		store_doc = frappe.get_cached_doc("Shopify Store", store)
+		if not store_doc.sync_prices:
+			continue
+
+		enqueue_sync(
+			store,
+			"price",
+			dedupe_key=f"price:{store}:{item_code}",
+			ref_doctype="Item",
+			ref_docname=item_code,
+		)
+
+
 def on_price_change(doc, method=None):
 	"""doc_event on Item Price. Computes a dedupe key and enqueues -- nothing else."""
 	if is_echo(doc):
@@ -128,16 +156,30 @@ def _item_from_key(dedupe_key: str | None) -> str | None:
 
 
 def current_price(store_doc, item_code: str):
-	"""The item's selling price on this store's price list, or None if it has none."""
+	"""The item's selling price for this store, or None if it genuinely has none.
+
+	The store's own price list wins. Failing that, the Item's **Standard Selling Rate**, which
+	is what ERPNext writes when someone types a rate on the Item form.
+
+	That fallback is not a nicety. ERPNext files the rate typed on the Item form under the
+	price list in Selling Settings, which is rarely the one a Shopify store is pointed at. So a
+	merchant sets a saree at 1,200, publishes it, and it goes live at 0.00 -- the price is
+	there, just on another list, and nothing says so.
+	"""
 	price_list = store_doc.selling_price_list or f"Shopify - {store_doc.name}"[:140]
 	value = frappe.db.get_value(
 		"Item Price",
 		{"item_code": item_code, "price_list": price_list, "selling": 1},
 		"price_list_rate",
 	)
-	if value in (None, ""):
-		return None
-	return from_document(flt(value))
+	if value not in (None, ""):
+		return from_document(flt(value))
+
+	standard = frappe.db.get_value("Item", item_code, "standard_rate")
+	if standard and flt(standard) > 0:
+		return from_document(flt(standard))
+
+	return None
 
 
 def _stamp_synced(link_names: list[str]) -> None:

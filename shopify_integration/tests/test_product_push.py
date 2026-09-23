@@ -101,3 +101,56 @@ class TestStorefrontCopyIsLeftAlone(ProductPushTestCase):
 		"""A merchant who installs the app and configures nothing keeps their copy."""
 		field = frappe.get_meta("Shopify Store").get_field("sync_item_titles")
 		self.assertIn(field.default, (None, "", "0"))
+
+
+class TestItemImageReachesShopify(FrappeTestCase):
+	"""Shopify fetches the image itself, so the URL has to be one it can actually reach.
+
+	Three ways that fails quietly, and each would store something wrong as the product photo:
+	a private file (Frappe serves those only to a session, so Shopify would save the login
+	page), a localhost site (nothing to fetch), and no image at all.
+	"""
+
+	def _item(self, image):
+		return frappe._dict(
+			{"name": "_Test Img", "image": image, "get": lambda k, d=None: image if k == "image" else d}
+		)
+
+	def test_an_absolute_url_is_passed_through(self):
+		url = "https://cdn.example.com/saree.png"
+		self.assertEqual(product_module.item_image_url(self._item(url)), url)
+
+	def test_no_image_is_none(self):
+		self.assertIsNone(product_module.item_image_url(self._item("")))
+		self.assertIsNone(product_module.item_image_url(self._item(None)))
+
+	def test_a_site_path_becomes_absolute(self):
+		with patch.object(product_module, "get_url", return_value="https://shop.example.com"):
+			self.assertEqual(
+				product_module.item_image_url(self._item("/files/saree.png")),
+				"https://shop.example.com/files/saree.png",
+			)
+
+	def test_spaces_and_commas_in_the_filename_are_encoded(self):
+		"""Real uploads are called things like 'ChatGPT Image Aug 24, 2026, 07_38_56 PM.png'."""
+		with patch.object(product_module, "get_url", return_value="https://shop.example.com"):
+			url = product_module.item_image_url(self._item("/files/A B, C.png"))
+		self.assertNotIn(" ", url)
+		self.assertTrue(url.startswith("https://shop.example.com/files/"))
+
+	def test_a_localhost_site_sends_nothing(self):
+		"""Shopify cannot fetch from a developer's laptop, and a broken image is worse than none."""
+		for base in ("http://localhost:8000", "http://127.0.0.1:8080", "http://mysite.localhost"):
+			with patch.object(product_module, "get_url", return_value=base):
+				self.assertIsNone(
+					product_module.item_image_url(self._item("/files/saree.png")),
+					f"{base} was treated as publicly reachable",
+				)
+
+	def test_a_private_file_sends_nothing(self):
+		"""Frappe serves private files only to a logged-in session; Shopify has none."""
+		with (
+			patch.object(product_module, "get_url", return_value="https://shop.example.com"),
+			patch.object(frappe.db, "exists", return_value=True),
+		):
+			self.assertIsNone(product_module.item_image_url(self._item("/private/files/x.png")))

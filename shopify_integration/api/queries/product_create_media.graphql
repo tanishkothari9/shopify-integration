@@ -1,0 +1,19 @@
+# Attach an image to a product. Shopify fetches `originalSource` itself, so the URL has to be
+# publicly reachable -- a localhost site cannot use this, and neither can a private file.
+mutation ProductCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+  productCreateMedia(productId: $productId, media: $media) {
+    media {
+      ... on MediaImage {
+        id
+        status
+        image {
+          url
+        }
+      }
+    }
+    mediaUserErrors {
+      field
+      message
+    }
+  }
+}

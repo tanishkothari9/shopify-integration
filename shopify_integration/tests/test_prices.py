@@ -238,3 +238,124 @@ class TestOneBadItemDoesNotSinkTheBatch(PriceTestCase):
 			"the mapped item's price must still reach Shopify even though the other item is "
 			"unmapped -- that is the whole point of skipping rather than raising",
 		)
+
+
+class TestTheItemCarriesAPriceToo(PriceTestCase):
+	"""ERPNext files a rate typed on the Item form under the price list in Selling Settings.
+
+	That is rarely the list a Shopify store points at. So a merchant sets a saree at 1,200,
+	publishes it, and it goes live at **0.00** — the price is there, just on another list, and
+	nothing anywhere says so. Found on a real item.
+
+	Standard Selling Rate is therefore a fallback source, and saving an Item has to queue a
+	price push, or the rate stays readable and never sent.
+	"""
+
+	def setUp(self):
+		super().setUp() if hasattr(super(), "setUp") else None
+		self.item = "_Test Std Rate Item"
+		if not frappe.db.exists("Item", self.item):
+			doc = frappe.new_doc("Item")
+			doc.item_code = self.item
+			doc.item_name = self.item
+			doc.item_group = frappe.db.get_value("Item Group", {"is_group": 0}, "name")
+			doc.stock_uom = "Nos"
+			with_hsn(doc)
+			doc.insert(ignore_permissions=True)
+		frappe.db.delete("Item Price", {"item_code": self.item})
+		frappe.db.set_value("Item", self.item, "standard_rate", 0, update_modified=False)
+		frappe.db.commit()
+
+	def tearDown(self):
+		frappe.db.delete("Item Price", {"item_code": self.item})
+		if frappe.db.exists("Item", self.item):
+			frappe.delete_doc("Item", self.item, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+	def _store_doc(self):
+		return frappe.get_cached_doc("Shopify Store", self.store)
+
+		# --- reading the price
+
+	def test_the_stores_own_list_wins(self):
+		frappe.db.set_value("Item", self.item, "standard_rate", 999, update_modified=False)
+		ip = frappe.new_doc("Item Price")
+		ip.item_code = self.item
+		ip.price_list = self.price_list
+		ip.price_list_rate = 1500
+		ip.selling = 1
+		ip.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		self.assertEqual(float(price_module.current_price(self._store_doc(), self.item)), 1500.0)
+
+	def test_the_standard_rate_is_used_when_the_list_has_nothing(self):
+		frappe.db.set_value("Item", self.item, "standard_rate", 1200, update_modified=False)
+		frappe.db.commit()
+
+		self.assertEqual(float(price_module.current_price(self._store_doc(), self.item)), 1200.0)
+
+	def test_a_price_on_another_list_does_not_leak(self):
+		"""A wholesale rate is not a shop price. Only this store's list, or the Item's own."""
+		ip = frappe.new_doc("Item Price")
+		ip.item_code = self.item
+		ip.price_list = self.other_list
+		ip.price_list_rate = 77
+		ip.selling = 1
+		ip.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		self.assertIsNone(price_module.current_price(self._store_doc(), self.item))
+
+	def test_no_price_anywhere_is_none_not_zero(self):
+		"""None, so a product can be held back rather than listed free."""
+		self.assertIsNone(price_module.current_price(self._store_doc(), self.item))
+
+	def test_a_zero_standard_rate_is_not_a_price(self):
+		frappe.db.set_value("Item", self.item, "standard_rate", 0, update_modified=False)
+		frappe.db.commit()
+
+		self.assertIsNone(price_module.current_price(self._store_doc(), self.item))
+
+		# --- sending it
+
+	def test_saving_the_item_queues_a_price_push(self):
+		"""The rate lives on the Item, so an Item save has to be able to send it."""
+		link = frappe.new_doc("Shopify Item Link")
+		link.store = self.store
+		link.item_code = self.item
+		link.product_gid = "gid://shopify/Product/9401"
+		link.variant_gid = "gid://shopify/ProductVariant/9401"
+		link.insert(ignore_permissions=True)
+		frappe.db.delete("Shopify Sync Queue", {"store": self.store, "operation": "price"})
+		frappe.db.commit()
+
+		doc = frappe.get_doc("Item", self.item)
+		doc.standard_rate = 1200
+		with patch.object(engine, "schedule_drain"):
+			doc.save(ignore_permissions=True)
+
+		self.assertEqual(
+			frappe.db.count(
+				"Shopify Sync Queue",
+				{"store": self.store, "operation": "price", "ref_docname": self.item},
+			),
+			1,
+			"the Item's own rate can never reach Shopify if saving it queues nothing",
+		)
+		frappe.delete_doc("Shopify Item Link", link.name, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+	def test_an_unlinked_item_queues_nothing(self):
+		doc = frappe.get_doc("Item", self.item)
+		doc.standard_rate = 500
+		with patch.object(engine, "schedule_drain"):
+			doc.save(ignore_permissions=True)
+
+		self.assertEqual(
+			frappe.db.count(
+				"Shopify Sync Queue",
+				{"store": self.store, "operation": "price", "ref_docname": self.item},
+			),
+			0,
+		)

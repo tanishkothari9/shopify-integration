@@ -43,8 +43,16 @@ scheduler_events = {
 # immediately for anything an inbound handler wrote. Removing that check loops forever.
 doc_events: dict = {
 	"Item": {
-		"after_insert": "shopify_integration.outbound.product.on_item_change",
-		"on_update": "shopify_integration.outbound.product.on_item_change",
+		"after_insert": [
+			"shopify_integration.outbound.product.on_item_change",
+			"shopify_integration.outbound.price.on_item_change",
+		],
+		"on_update": [
+			"shopify_integration.outbound.product.on_item_change",
+			# The Item carries a price too -- Standard Selling Rate is where ERPNext puts a
+			# rate typed on the form. Without this it was readable and never sent.
+			"shopify_integration.outbound.price.on_item_change",
+		],
 	},
 	# Every physical stock movement: POS, Delivery Note, Stock Entry, Purchase Receipt,
 	# Reconciliation. ERPNext creates SLEs via sle.submit(), so doc events do fire here.

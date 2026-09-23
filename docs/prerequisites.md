@@ -211,6 +211,30 @@ creates — correct them in ERPNext afterwards.
 One row per Shopify location, pointing at an ERPNext warehouse. Without this, stock has nowhere
 to go.
 
+### 2.6a Pricing and images
+
+**Where the price comes from.** The app looks at the store's **Selling Price List** first, and
+falls back to the Item's **Standard Selling Rate**.
+
+That fallback matters. ERPNext files a rate typed on the Item form under the price list in
+**Selling Settings**, which is rarely the one your Shopify store points at — so without it you
+set a saree at ₹1,200, publish, and it goes live at **₹0.00** with nothing to tell you why.
+
+If an item has no price on either, it is published as a **draft** rather than active. A free
+saree in a live shop is worse than one you have yet to price.
+
+**Images.** The Item's image is sent to Shopify when the product is created, and later if the
+product still has none. Shopify fetches the file itself, so three things stop it working:
+
+| | |
+|---|---|
+| The file is **private** | Frappe serves those only to a logged-in session. Re-upload it with "private" unticked |
+| Your site is on **localhost** | Shopify cannot reach it. Set `host_name` in `site_config.json` to a public URL |
+| The Item has no image | Nothing to send |
+
+The app adds an image only when the product has none. Photography you add in Shopify is yours
+and is never overwritten.
+
 ### 2.7 Tick Enabled, then choose what syncs
 
 Saving with **Enabled** on registers the webhooks with Shopify. Then turn on what you want:
