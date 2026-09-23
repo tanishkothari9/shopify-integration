@@ -55,8 +55,10 @@ Working today:
 - `orders/cancelled` → cancels the linked documents, dependents first
 - Customers matched on Shopify GID, never duplicated; guest checkouts fall back to the
   store's default customer
-- Tax lines mapped to account heads and consolidated; tax-inclusive pricing, per-line
-  discounts, shipping as either a charge or a line item, and multi-currency
+- Tax lines mapped to account heads and consolidated; tax-inclusive pricing, shipping as
+  either a charge or a line item, and multi-currency
+- Discount codes are booked at the price Shopify charged — percentage, fixed-amount and
+  free-shipping coupons alike. Tax follows the discounted amount, not the list price
 - **No document is submitted whose total disagrees with Shopify's.** Every amount is a
   `Decimal` from parse to post
 

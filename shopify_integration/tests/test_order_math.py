@@ -413,3 +413,92 @@ def test_two_shipping_lines_are_measured_against_the_combined_net():
 		shippingLines={"nodes": [leg(0.09, "9.00"), leg(0.025, "2.50")]},
 	)
 	assert shipping_tax_rates(_Store(), o, SHOP_MONEY) == {"Output Tax CGST - TC": Decimal("5.75")}
+
+
+# --------------------------------------------------------------------------------------
+# Coupon codes
+#
+# Shopify records an order-level discount -- which is what a coupon code is -- only in the
+# line's ``discountAllocations`` and in ``discountedUnitPriceAfterAllDiscountsSet``. It
+# leaves ``discountedUnitPriceSet`` and ``totalDiscountSet`` alone, so reading those books
+# the undiscounted price and the document total lands above Shopify's. The shapes below are
+# taken verbatim from a live 10% coupon order.
+# --------------------------------------------------------------------------------------
+
+
+def coupon_line(sku, quantity, original, after_all, allocated):
+	"""A line as Shopify states it once an order-level discount has been allocated to it."""
+	return {
+		"quantity": quantity,
+		"sku": sku,
+		"originalUnitPriceSet": bag(original),
+		"discountedUnitPriceSet": bag(original),
+		"discountedUnitPriceAfterAllDiscountsSet": bag(after_all),
+		"originalTotalSet": bag(original),
+		"discountedTotalSet": bag(original),
+		"totalDiscountSet": bag("0.00"),
+		"discountAllocations": [{"allocatedAmountSet": bag(allocated)}],
+		"taxLines": [],
+	}
+
+
+def test_a_coupon_discount_reaches_the_line_rate():
+	from shopify_integration.utils.taxes import unit_rate
+
+	line = coupon_line("SAREE-001", 1, "4500.00", "4495.50", "4.50")
+	assert unit_rate(line, SHOP_MONEY) == Decimal("4495.50")
+
+
+def test_a_coupon_order_reconciles_with_shopifys_own_subtotal():
+	"""The regression: these lines summed to 5700.00, Shopify said 5694.30, and the order
+	was refused rather than posted."""
+	from shopify_integration.utils.taxes import _gross_line_total
+
+	o = order(
+		lineItems={
+			"nodes": [
+				coupon_line("SAREE-001", 1, "4500.00", "4495.50", "4.50"),
+				coupon_line("KURTI-001", 1, "1200.00", "1198.80", "1.20"),
+			]
+		}
+	)
+	assert _gross_line_total(o, SHOP_MONEY) == Decimal("5694.30")
+
+
+def test_a_coupon_discount_shrinks_the_tax_base_on_an_inclusive_order():
+	from shopify_integration.utils.taxes import line_net
+
+	line = coupon_line("SAREE-001", 1, "4500.00", "4495.50", "4.50")
+	line["taxLines"] = [{"title": "CGST", "rate": 0.025, "priceSet": bag("107.04")}]
+	assert line_net(line, SHOP_MONEY, True) == Decimal("4388.46")
+
+
+def test_a_line_given_away_free_is_not_mistaken_for_a_missing_field():
+	"""A 100% discount states the price as 0.00. Testing the field for truth rather than
+	presence would fall through to the undiscounted reading and charge for it."""
+	from shopify_integration.utils.taxes import _gross_line_total, unit_rate
+
+	line = coupon_line("GIFT-001", 1, "999.00", "0.00", "999.00")
+	assert unit_rate(line, SHOP_MONEY) == Decimal("0.00")
+	assert _gross_line_total(order(lineItems={"nodes": [line]}), SHOP_MONEY) == Decimal("0.00")
+
+
+def test_a_payload_without_the_field_is_still_read_the_old_way():
+	from shopify_integration.utils.taxes import _gross_line_total
+
+	line = {
+		"quantity": 2,
+		"sku": "TEE",
+		"originalUnitPriceSet": bag("50.00"),
+		"discountedUnitPriceSet": bag("45.00"),
+		"taxLines": [],
+	}
+	assert _gross_line_total(order(lineItems={"nodes": [line]}), SHOP_MONEY) == Decimal("90.00")
+
+
+def test_a_multi_quantity_coupon_line_is_priced_per_unit():
+	from shopify_integration.utils.taxes import _gross_line_total, unit_rate
+
+	line = coupon_line("MUG-001", 3, "333.33", "300.00", "99.99")
+	assert unit_rate(line, SHOP_MONEY) == Decimal("300.00")
+	assert _gross_line_total(order(lineItems={"nodes": [line]}), SHOP_MONEY) == Decimal("900.00")

@@ -6,9 +6,12 @@ in Decimal, and refuse to post a document whose total disagrees with the order.
 
 Three choices are worth stating outright:
 
-* **Discounts are taken as Shopify allocated them.** ``discountedUnitPriceSet`` is the price
-  after Shopify spread order-level discounts across lines. Re-deriving that allocation is how
-  you end up a cent out on orders with a percentage discount over an odd number of lines.
+* **Discounts are taken as Shopify allocated them**, from
+  ``discountedUnitPriceAfterAllDiscountsSet``. The similarly named ``discountedUnitPriceSet``
+  is *not* that figure: it nets off discounts applied to the line itself but ignores an
+  order-level one -- a coupon code -- which Shopify records per line only under
+  ``discountAllocations``. Re-deriving the allocation ourselves is how you end up a cent out
+  on a percentage discount over an odd number of lines, so take Shopify's own field.
 * **Tax-inclusive pricing uses ERPNext's own percentage mechanism.** Subtracting tax from
   the rate by hand cannot work: a 9.09 tax over 2 units needs a net rate of 45.455, which is
   not representable at two-decimal currency precision, so the line lands a cent out. The
@@ -150,11 +153,24 @@ def _group_by_account(store_doc, entries: list[dict], order: dict) -> tuple[dict
 	return by_account, titles
 
 
+def line_gross(line: dict, side: str) -> Decimal:
+	"""What the customer actually pays for one line, after every discount.
+
+	Falls back to the pre-``discountedUnitPriceAfterAllDiscountsSet`` reading only when the
+	field is absent, which no live payload is -- the order query asks for it. Presence is
+	tested rather than truth, because a line given away free is legitimately zero.
+	"""
+	quantity = Decimal(line.get("quantity") or 0)
+	if line.get("discountedUnitPriceAfterAllDiscountsSet") is not None:
+		return money_field(line, "discountedUnitPriceAfterAllDiscountsSet", side) * quantity
+	return money_field(line, "discountedTotalSet", side) or (
+		money_field(line, "discountedUnitPriceSet", side) * quantity
+	)
+
+
 def line_net(line: dict, side: str, taxes_included: bool) -> Decimal:
 	"""One line's value excluding tax, whichever way Shopify quoted it."""
-	gross = money_field(line, "discountedTotalSet", side) or (
-		money_field(line, "discountedUnitPriceSet", side) * Decimal(line.get("quantity") or 0)
-	)
+	gross = line_gross(line, side)
 	return gross - line_tax_total(line, side) if taxes_included else gross
 
 
@@ -520,9 +536,7 @@ def _shipping_tax_rows(store_doc, order: dict, side: str, inclusive: bool) -> li
 def _gross_line_total(order: dict, side: str) -> Decimal:
 	total = ZERO
 	for line in (order.get("lineItems") or {}).get("nodes") or []:
-		total += money_field(line, "discountedTotalSet", side) or (
-			money_field(line, "discountedUnitPriceSet", side) * Decimal(line.get("quantity") or 0)
-		)
+		total += line_gross(line, side)
 	return total
 
 
@@ -541,6 +555,8 @@ def unit_rate(line: dict, side: str) -> Decimal:
 	``included_in_print_rate``. Doing that subtraction here instead loses precision -- see the
 	module docstring.
 	"""
+	if line.get("discountedUnitPriceAfterAllDiscountsSet") is not None:
+		return money_field(line, "discountedUnitPriceAfterAllDiscountsSet", side)
 	return money_field(line, "discountedUnitPriceSet", side)
 
 

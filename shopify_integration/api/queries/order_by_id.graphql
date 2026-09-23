@@ -60,8 +60,10 @@ query order($id: ID!) {
         variant { id }
         originalUnitPriceSet { shopMoney { amount } presentmentMoney { amount } }
         discountedUnitPriceSet { shopMoney { amount } presentmentMoney { amount } }
+        discountedUnitPriceAfterAllDiscountsSet { shopMoney { amount } presentmentMoney { amount } }
         originalTotalSet { shopMoney { amount } presentmentMoney { amount } }
         discountedTotalSet { shopMoney { amount } presentmentMoney { amount } }
+        discountAllocations { allocatedAmountSet { shopMoney { amount } presentmentMoney { amount } } }
         taxLines { title rate priceSet { shopMoney { amount } presentmentMoney { amount } } }
       }
       pageInfo { hasNextPage endCursor }
