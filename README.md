@@ -200,8 +200,8 @@ The full suite needs a site:
 bench --site your-site.localhost run-tests --app shopify_integration
 ```
 
-Most of it is pure and needs no site at all, but those files have to be excluded by name —
-see the exact command in [CONTRIBUTING.md](CONTRIBUTING.md), which CI runs verbatim.
+Most of it is pure and needs no site, but those files have to be excluded by name and still
+need frappe importable — see the exact command in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 CI runs the site-bound suite **twice on the same site**. Handlers commit deliberately, so a
 test that does not clean up after itself passes once and fails on every run after.

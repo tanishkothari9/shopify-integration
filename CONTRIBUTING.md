@@ -16,7 +16,8 @@ bench --site yoursite.localhost install-app shopify_integration
 
 Two suites, and both must pass.
 
-The pure ones need no site:
+The pure ones need no site, but they still import frappe, so run them with your bench's
+Python rather than a bare one:
 
 ```bash
 pytest shopify_integration/tests -q --ignore=shopify_integration/tests/test_catalogue.py --ignore=shopify_integration/tests/test_handlers.py --ignore=shopify_integration/tests/test_integration.py --ignore=shopify_integration/tests/test_inventory.py --ignore=shopify_integration/tests/test_fulfillment.py --ignore=shopify_integration/tests/test_orders.py --ignore=shopify_integration/tests/test_prices.py --ignore=shopify_integration/tests/test_product_push.py --ignore=shopify_integration/tests/test_reconcile.py --ignore=shopify_integration/tests/test_refunds.py
@@ -28,7 +29,8 @@ The rest need a site:
 bench --site yoursite.localhost run-tests --app shopify_integration
 ```
 
-CI runs the suite **twice on the same site**. Handlers commit deliberately, so a test that does
+CI runs only lint in the fast job — frappe is not pip-installable in a bare runner — and runs
+the full suite against a real site **twice**. Handlers commit deliberately, so a test that does
 not clean up after itself passes once and fails on every run after.
 
 ## Style
