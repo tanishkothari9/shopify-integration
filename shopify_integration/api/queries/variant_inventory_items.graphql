@@ -1,0 +1,13 @@
+# The inventoryItem GID for a batch of variants, used to backfill migrated mappings.
+# The old app never cached this, which is why its inventory push cost two calls per item.
+query variantInventoryItems($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on ProductVariant {
+      id
+      sku
+      inventoryItem {
+        id
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+# Prices live on variants, and productUpdate cannot touch them -- Shopify's own docs say to
+# use this mutation for price changes instead.
+#
+# Note the shape: variants are updated per PRODUCT, so a batch of price changes has to be
+# grouped by product rather than sent as one flat list.
+mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+  productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+    productVariants {
+      id
+      price
+      compareAtPrice
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

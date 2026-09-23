@@ -1,0 +1,11 @@
+# Cheapest authenticated query available: used as the connection test when a store is
+# saved, to prove the token, the shop domain and the pinned API version all agree.
+query shop {
+  shop {
+    id
+    name
+    myshopifyDomain
+    currencyCode
+    ianaTimezone
+  }
+}

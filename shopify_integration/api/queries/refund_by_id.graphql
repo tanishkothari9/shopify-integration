@@ -1,0 +1,55 @@
+# One refund, in the shape the credit-note builder expects.
+#
+# restockType is the field that decides whether stock comes back:
+#   NO_RESTOCK     -- the goods are not returning (damaged, written off)
+#   RETURN         -- physically returned by the customer
+#   CANCEL         -- cancelled before shipping, so the units return to inventory
+#   LEGACY_RESTOCK -- older orders, treated as a return
+# Only NO_RESTOCK means "do not bring the stock back".
+query refund($id: ID!) {
+  refund(id: $id) {
+    id
+    createdAt
+    note
+    order {
+      id
+      name
+    }
+    totalRefundedSet {
+      shopMoney { amount currencyCode }
+      presentmentMoney { amount currencyCode }
+    }
+    refundLineItems(first: 250) {
+      nodes {
+        quantity
+        restockType
+        location { id name }
+        lineItem {
+          id
+          sku
+          title
+          variant { id }
+        }
+        priceSet { shopMoney { amount } presentmentMoney { amount } }
+        subtotalSet { shopMoney { amount } presentmentMoney { amount } }
+        totalTaxSet { shopMoney { amount } presentmentMoney { amount } }
+      }
+    }
+    refundShippingLines(first: 20) {
+      nodes {
+        shippingLine { title }
+        subtotalAmountSet { shopMoney { amount } presentmentMoney { amount } }
+        taxAmountSet { shopMoney { amount } presentmentMoney { amount } }
+      }
+    }
+    transactions(first: 20) {
+      nodes {
+        id
+        kind
+        status
+        gateway
+        amountSet { shopMoney { amount } presentmentMoney { amount } }
+      }
+    }
+  }
+}

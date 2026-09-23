@@ -1,0 +1,22 @@
+# Current availability for a batch of inventory items, used for two things:
+#   1. the compareQuantity values the set mutation needs
+#   2. drift detection (§10.4)
+# One batched read for a whole drain group, never one call per item.
+query inventoryLevels($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on InventoryItem {
+      id
+      inventoryLevels(first: 20) {
+        nodes {
+          location {
+            id
+          }
+          quantities(names: ["available"]) {
+            name
+            quantity
+          }
+        }
+      }
+    }
+  }
+}

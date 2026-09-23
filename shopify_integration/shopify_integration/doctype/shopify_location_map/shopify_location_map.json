@@ -1,0 +1,27 @@
+{
+ "actions": [],
+ "creation": "2026-09-16 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": ["warehouse", "location_gid", "location_name"],
+ "fields": [
+  {"fieldname": "warehouse", "fieldtype": "Link", "in_list_view": 1, "label": "Warehouse", "options": "Warehouse", "reqd": 1,
+   "description": "May be a group warehouse, which consolidates all descendant leaf warehouses into this one Shopify location."},
+  {"fieldname": "location_gid", "fieldtype": "Data", "in_list_view": 1, "label": "Location GID", "reqd": 1,
+   "description": "gid://shopify/Location/..."},
+  {"fieldname": "location_name", "fieldtype": "Data", "in_list_view": 1, "label": "Location Name", "read_only": 1}
+ ],
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-09-16 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Shopify Integration",
+ "name": "Shopify Location Map",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

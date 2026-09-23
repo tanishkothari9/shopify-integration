@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+node_modules/
+*.log
+
+# never commit credentials
+.env
+.env.*
+*.key
+*.pem
+*.p12
+secrets.json
+site_config.json

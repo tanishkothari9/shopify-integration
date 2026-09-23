@@ -1,0 +1,21 @@
+# Attaches carrier and tracking number to a fulfilment that already exists.
+#
+# Separate from creation because the two happen at different moments: the Delivery Note says
+# what shipped, and the Shipment that follows says who is carrying it and under what number.
+mutation fulfillmentTrackingInfoUpdate(
+  $fulfillmentId: ID!
+  $trackingInfoInput: FulfillmentTrackingInput!
+  $notifyCustomer: Boolean
+) {
+  fulfillmentTrackingInfoUpdate(
+    fulfillmentId: $fulfillmentId
+    trackingInfoInput: $trackingInfoInput
+    notifyCustomer: $notifyCustomer
+  ) {
+    fulfillment {
+      id
+      trackingInfo { number company url }
+    }
+    userErrors { field message }
+  }
+}

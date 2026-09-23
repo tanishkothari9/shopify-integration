@@ -1,0 +1,51 @@
+# Single-product fetch for the webhook and lazy-resolution paths. The shape below must stay
+# in step with bulk_products.graphql: all three import paths converge on one mapping writer,
+# which assumes one product shape.
+query product($id: ID!) {
+  product(id: $id) {
+    id
+    title
+    handle
+    description
+    status
+    productType
+    vendor
+    updatedAt
+    options {
+      name
+      position
+      values
+    }
+    variants(first: 100) {
+      edges {
+        node {
+          id
+          title
+          sku
+          barcode
+          price
+          compareAtPrice
+          position
+          inventoryPolicy
+          selectedOptions {
+            name
+            value
+          }
+          inventoryItem {
+            id
+            measurement {
+              weight {
+                value
+                unit
+              }
+            }
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}

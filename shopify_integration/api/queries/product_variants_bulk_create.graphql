@@ -1,0 +1,23 @@
+# Adds variants to a product that already exists.
+#
+# REMOVE_STANDALONE_VARIANT is what makes this usable: productCreate always leaves behind one
+# default variant, and without removing it the product ends up with a phantom "Default Title"
+# alongside the real ones. Shopify only accepts that strategy on the first call, so later
+# additions use DEFAULT.
+mutation productVariantsBulkCreate(
+  $productId: ID!
+  $variants: [ProductVariantsBulkInput!]!
+  $strategy: ProductVariantsBulkCreateStrategy
+) {
+  productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
+    productVariants {
+      id
+      title
+      sku
+      price
+      selectedOptions { name value }
+      inventoryItem { id }
+    }
+    userErrors { field message }
+  }
+}

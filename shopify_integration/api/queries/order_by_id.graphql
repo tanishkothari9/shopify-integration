@@ -1,0 +1,84 @@
+# One order, in the shape the order mapper expects.
+#
+# Orders are refetched over GraphQL rather than read from the webhook body. The webhook
+# payload is the legacy REST shape: snake_case, single-currency, and without the MoneyBag
+# that multi-currency depends on. Refetching costs one cheap query and means the mapper sees
+# one shape from every path, exactly as the product importer does.
+#
+# Every amount is a MoneyBag: shopMoney is in the company's base currency, presentmentMoney
+# is what the customer actually paid. Using Shopify's own figures for both is what §13.3
+# means by preferring them over re-deriving from a rate table.
+query order($id: ID!) {
+  order(id: $id) {
+    id
+    name
+    createdAt
+    processedAt
+    cancelledAt
+    cancelReason
+    note
+    currencyCode
+    taxesIncluded
+    displayFinancialStatus
+    displayFulfillmentStatus
+
+    totalPriceSet { shopMoney { amount currencyCode } presentmentMoney { amount currencyCode } }
+    subtotalPriceSet { shopMoney { amount } presentmentMoney { amount } }
+    totalTaxSet { shopMoney { amount } presentmentMoney { amount } }
+    totalDiscountsSet { shopMoney { amount } presentmentMoney { amount } }
+    totalShippingPriceSet { shopMoney { amount } presentmentMoney { amount } }
+    totalOutstandingSet { shopMoney { amount } presentmentMoney { amount } }
+
+    customer {
+      id
+      firstName
+      lastName
+      email
+      phone
+    }
+    billingAddress { firstName lastName address1 address2 city province provinceCode zip country countryCodeV2 phone }
+    shippingAddress { firstName lastName address1 address2 city province provinceCode zip country countryCodeV2 phone }
+
+    taxLines { title rate priceSet { shopMoney { amount } presentmentMoney { amount } } }
+
+    shippingLines(first: 20) {
+      nodes {
+        title
+        originalPriceSet { shopMoney { amount } presentmentMoney { amount } }
+        discountedPriceSet { shopMoney { amount } presentmentMoney { amount } }
+        taxLines { title rate priceSet { shopMoney { amount } presentmentMoney { amount } } }
+      }
+    }
+
+    lineItems(first: 250) {
+      nodes {
+        id
+        title
+        quantity
+        sku
+        taxable
+        variant { id }
+        originalUnitPriceSet { shopMoney { amount } presentmentMoney { amount } }
+        discountedUnitPriceSet { shopMoney { amount } presentmentMoney { amount } }
+        originalTotalSet { shopMoney { amount } presentmentMoney { amount } }
+        discountedTotalSet { shopMoney { amount } presentmentMoney { amount } }
+        taxLines { title rate priceSet { shopMoney { amount } presentmentMoney { amount } } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+
+    fulfillments(first: 50) {
+      id
+      status
+      createdAt
+      location { id name }
+      fulfillmentLineItems(first: 250) {
+        nodes {
+          id
+          quantity
+          lineItem { id sku variant { id } }
+        }
+      }
+    }
+  }
+}

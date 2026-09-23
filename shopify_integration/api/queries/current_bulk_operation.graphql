@@ -1,0 +1,17 @@
+# objectCount counts everything including variants; rootObjectCount counts only products,
+# which is the number worth showing a user watching an import.
+query currentBulkOperation($type: BulkOperationType!) {
+  currentBulkOperation(type: $type) {
+    id
+    type
+    status
+    errorCode
+    createdAt
+    completedAt
+    objectCount
+    rootObjectCount
+    fileSize
+    url
+    partialDataUrl
+  }
+}

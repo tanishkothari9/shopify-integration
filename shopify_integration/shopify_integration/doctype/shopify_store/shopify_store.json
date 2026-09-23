@@ -1,0 +1,444 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "field:store_name",
+ "creation": "2026-09-16 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "store_name",
+  "enabled",
+  "column_break_conn",
+  "shop_domain",
+  "api_version",
+  "section_credentials",
+  "client_id",
+  "admin_api_token",
+  "column_break_cred",
+  "api_secret",
+  "section_erpnext",
+  "company",
+  "currency",
+  "cost_center",
+  "column_break_erp",
+  "default_customer",
+  "customer_group",
+  "default_warehouse",
+  "section_accounts",
+  "selling_price_list",
+  "column_break_acct",
+  "cash_bank_account",
+  "shipping_item",
+  "section_series",
+  "sales_order_series",
+  "sales_invoice_series",
+  "column_break_series",
+  "delivery_note_series",
+  "credit_note_series",
+  "section_inbound",
+  "sync_orders",
+  "sync_invoices",
+  "column_break_inbound",
+  "sync_delivery_notes",
+  "sync_refunds",
+  "section_outbound",
+  "sync_inventory",
+  "sync_items",
+  "sync_item_titles",
+  "column_break_outbound",
+  "sync_prices",
+  "publish_new_items",
+  "sync_fulfillments",
+  "notify_customer_on_fulfillment",
+  "create_missing_items",
+  "section_locations",
+  "location_map",
+  "section_taxes",
+  "tax_map",
+  "default_hsn_code",
+  "section_status",
+  "installed_on",
+  "granted_scopes",
+  "last_reconciled_on",
+  "reconcile_enabled",
+  "last_reconciliation_summary",
+  "column_break_status",
+  "webhook_callback_url"
+ ],
+ "fields": [
+  {
+   "fieldname": "store_name",
+   "fieldtype": "Data",
+   "label": "Store Name",
+   "reqd": 1,
+   "unique": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled",
+   "default": "0",
+   "in_list_view": 1,
+   "description": "Enabling registers webhook subscriptions with Shopify. Disabling removes them."
+  },
+  {
+   "fieldname": "column_break_conn",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "shop_domain",
+   "fieldtype": "Data",
+   "label": "Shop Domain",
+   "reqd": 1,
+   "unique": 1,
+   "in_list_view": 1,
+   "description": "e.g. my-shop.myshopify.com"
+  },
+  {
+   "fieldname": "api_version",
+   "fieldtype": "Data",
+   "label": "API Version",
+   "reqd": 1,
+   "default": "2026-01",
+   "description": "Pinned Shopify Admin API version, e.g. 2026-01. Shopify releases quarterly and sunsets a version after 12 months."
+  },
+  {
+   "fieldname": "section_credentials",
+   "fieldtype": "Section Break",
+   "label": "Credentials"
+  },
+  {
+   "fieldname": "client_id",
+   "fieldtype": "Data",
+   "label": "Client ID",
+   "description": "From your app in the Shopify Dev Dashboard. Legacy custom apps, which merchants can no longer create, did not use this."
+  },
+  {
+   "fieldname": "admin_api_token",
+   "fieldtype": "Password",
+   "label": "Admin API Access Token",
+   "reqd": 0,
+   "description": "Filled in automatically by Install with Shopify. Only paste one by hand if you have a legacy custom app token."
+  },
+  {
+   "fieldname": "column_break_cred",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "api_secret",
+   "fieldtype": "Password",
+   "label": "Client Secret / API Secret Key",
+   "reqd": 1,
+   "description": "From the Dev Dashboard app. Used both to exchange the OAuth code for a token and to verify the HMAC on every incoming webhook."
+  },
+  {
+   "fieldname": "section_erpnext",
+   "fieldtype": "Section Break",
+   "label": "ERPNext Defaults"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Link",
+   "label": "Currency",
+   "options": "Currency",
+   "description": "The store's presentment currency. If it differs from the Company currency, documents carry a conversion rate."
+  },
+  {
+   "fieldname": "cost_center",
+   "fieldtype": "Link",
+   "label": "Cost Center",
+   "options": "Cost Center"
+  },
+  {
+   "fieldname": "column_break_erp",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "default_customer",
+   "fieldtype": "Link",
+   "label": "Default Customer",
+   "options": "Customer",
+   "description": "Fallback for guest checkouts."
+  },
+  {
+   "fieldname": "customer_group",
+   "fieldtype": "Link",
+   "label": "Customer Group",
+   "options": "Customer Group",
+   "link_filters": "[[\"Customer Group\",\"is_group\",\"=\",0]]",
+   "description": "Group new Shopify customers land in. Leave blank to use Individual. Group-type nodes are not offered: ERPNext refuses them on a Customer."
+  },
+  {
+   "fieldname": "default_warehouse",
+   "fieldtype": "Link",
+   "label": "Default Warehouse",
+   "options": "Warehouse"
+  },
+  {
+   "fieldname": "section_accounts",
+   "fieldtype": "Section Break",
+   "label": "Pricing and Accounts"
+  },
+  {
+   "fieldname": "selling_price_list",
+   "fieldtype": "Link",
+   "label": "Selling Price List",
+   "options": "Price List"
+  },
+  {
+   "fieldname": "column_break_acct",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "cash_bank_account",
+   "fieldtype": "Link",
+   "label": "Cash / Bank Account",
+   "options": "Account",
+   "description": "Payment Entries for paid Shopify orders are booked against this account."
+  },
+  {
+   "fieldname": "shipping_item",
+   "fieldtype": "Link",
+   "label": "Shipping Item",
+   "options": "Item",
+   "description": "Used when shipping is booked as a line item rather than a charge."
+  },
+  {
+   "fieldname": "section_series",
+   "fieldtype": "Section Break",
+   "label": "Naming Series",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "sales_order_series",
+   "fieldtype": "Select",
+   "label": "Sales Order Series"
+  },
+  {
+   "fieldname": "sales_invoice_series",
+   "fieldtype": "Select",
+   "label": "Sales Invoice Series"
+  },
+  {
+   "fieldname": "column_break_series",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "delivery_note_series",
+   "fieldtype": "Select",
+   "label": "Delivery Note Series"
+  },
+  {
+   "fieldname": "credit_note_series",
+   "fieldtype": "Select",
+   "label": "Credit Note Series"
+  },
+  {
+   "fieldname": "section_inbound",
+   "fieldtype": "Section Break",
+   "label": "Inbound (Shopify to ERPNext)"
+  },
+  {
+   "fieldname": "sync_orders",
+   "fieldtype": "Check",
+   "label": "Sync Orders",
+   "default": "1"
+  },
+  {
+   "fieldname": "sync_invoices",
+   "fieldtype": "Check",
+   "label": "Sync Invoices",
+   "default": "0"
+  },
+  {
+   "fieldname": "column_break_inbound",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "sync_delivery_notes",
+   "fieldtype": "Check",
+   "label": "Sync Delivery Notes",
+   "default": "0"
+  },
+  {
+   "fieldname": "sync_refunds",
+   "fieldtype": "Check",
+   "label": "Sync Refunds",
+   "default": "0"
+  },
+  {
+   "fieldname": "section_outbound",
+   "fieldtype": "Section Break",
+   "label": "Outbound (ERPNext to Shopify)"
+  },
+  {
+   "fieldname": "sync_inventory",
+   "fieldtype": "Check",
+   "label": "Sync Inventory",
+   "default": "0"
+  },
+  {
+   "fieldname": "sync_items",
+   "fieldtype": "Check",
+   "label": "Sync Items",
+   "default": "0"
+  },
+  {
+   "fieldname": "sync_item_titles",
+   "fieldtype": "Check",
+   "label": "Let ERPNext Overwrite Shopify Titles and Descriptions",
+   "default": "0",
+   "description": "Off by default, and think hard before turning it on. Shopify holds your storefront copy -- the title a customer reads, the description someone wrote for the product page. With this on, any edit to the Item in ERPNext replaces both with ERPNext's plain values, including an edit to something unrelated like a weight."
+  },
+  {
+   "fieldname": "column_break_outbound",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "sync_prices",
+   "fieldtype": "Check",
+   "label": "Sync Prices",
+   "default": "0"
+  },
+  {
+   "fieldname": "publish_new_items",
+   "fieldtype": "Check",
+   "label": "Publish New Items to Shopify",
+   "default": "0",
+   "description": "Create Shopify products for ERPNext items ticked 'Publish to Shopify'. Both have to be on, so nothing reaches a live shop by accident."
+  },
+  {
+   "fieldname": "sync_fulfillments",
+   "fieldtype": "Check",
+   "label": "Sync Fulfilments to Shopify",
+   "default": "0",
+   "description": "Mark orders fulfilled in Shopify when you submit a Delivery Note, and attach carrier and tracking when you submit a Shipment for it. Off by default: it emails your customers."
+  },
+  {
+   "fieldname": "notify_customer_on_fulfillment",
+   "fieldtype": "Check",
+   "label": "Email Customer on Fulfilment",
+   "default": "0",
+   "depends_on": "eval:doc.sync_fulfillments",
+   "description": "Let Shopify send its dispatch email. Leave off while importing a backlog of orders that already shipped, or every one of those customers hears from you again."
+  },
+  {
+   "fieldname": "create_missing_items",
+   "fieldtype": "Check",
+   "label": "Create Missing Items",
+   "default": "0",
+   "description": "Create an ERPNext Item when an order arrives for an unknown SKU."
+  },
+  {
+   "fieldname": "section_locations",
+   "fieldtype": "Section Break",
+   "label": "Location Mapping"
+  },
+  {
+   "fieldname": "location_map",
+   "fieldtype": "Table",
+   "label": "Location Map",
+   "options": "Shopify Location Map"
+  },
+  {
+   "fieldname": "section_taxes",
+   "fieldtype": "Section Break",
+   "label": "Tax Mapping"
+  },
+  {
+   "fieldname": "tax_map",
+   "fieldtype": "Table",
+   "label": "Tax Map",
+   "options": "Shopify Tax Mapping"
+  },
+  {
+   "fieldname": "default_hsn_code",
+   "fieldtype": "Data",
+   "label": "Default HSN/SAC Code",
+   "description": "India only. Six or eight digits. Given to items this app creates, which Shopify has no HSN for. Without it, india_compliance refuses to save the item and the whole catalogue import fails. An item that already has a code keeps it, always."
+  },
+  {
+   "fieldname": "section_status",
+   "fieldtype": "Section Break",
+   "label": "Status"
+  },
+  {
+   "fieldname": "installed_on",
+   "fieldtype": "Datetime",
+   "label": "Installed On",
+   "read_only": 1,
+   "description": "When the OAuth install completed and a token was stored."
+  },
+  {
+   "fieldname": "granted_scopes",
+   "fieldtype": "Small Text",
+   "label": "Granted Scopes",
+   "read_only": 1,
+   "description": "What Shopify actually granted. A merchant can approve fewer scopes than requested."
+  },
+  {
+   "fieldname": "last_reconciled_on",
+   "fieldtype": "Datetime",
+   "label": "Last Reconciled On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "reconcile_enabled",
+   "fieldtype": "Check",
+   "label": "Daily Reconciliation",
+   "default": "1",
+   "description": "Runs a drift check every night, repairing anything webhooks dropped."
+  },
+  {
+   "fieldname": "last_reconciliation_summary",
+   "fieldtype": "Code",
+   "options": "JSON",
+   "label": "Last Reconciliation Summary",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_status",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "webhook_callback_url",
+   "fieldtype": "Data",
+   "label": "Webhook Callback URL",
+   "read_only": 1,
+   "description": "The endpoint Shopify posts to. Registered automatically; shown for support."
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-09-16 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Shopify Integration",
+ "name": "Shopify Store",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

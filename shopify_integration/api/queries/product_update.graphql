@@ -1,0 +1,15 @@
+# Outbound: update a product we already have a Shopify Item Link for. Phase 2 does not
+# create new Shopify products from ERPNext items -- see outbound/product.py.
+mutation productUpdate($product: ProductUpdateInput!) {
+  productUpdate(product: $product) {
+    product {
+      id
+      title
+      updatedAt
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

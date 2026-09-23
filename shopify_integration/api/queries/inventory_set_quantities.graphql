@@ -1,0 +1,25 @@
+# Absolute set, not a delta (spec core principle 2). We push the availability read at drain
+# time, so duplicated or out-of-order queue rows converge on the truth instead of compounding.
+#
+# `reason` is REQUIRED -- the spec's §10.3 sketch omits it, and the mutation fails without it.
+# `compareQuantity` is optimistic concurrency: if someone changed the level in Shopify admin
+# since we read it, the write is rejected rather than silently clobbering their change.
+mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
+  inventorySetQuantities(input: $input) {
+    inventoryAdjustmentGroup {
+      createdAt
+      reason
+      referenceDocumentUri
+      changes {
+        name
+        delta
+        quantityAfterChange
+      }
+    }
+    userErrors {
+      code
+      field
+      message
+    }
+  }
+}

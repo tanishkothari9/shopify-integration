@@ -1,0 +1,54 @@
+# The inner document handed to bulkOperationRunQuery as a string.
+#
+# Bulk queries must have at least one connection, at most five, and at most two levels of
+# nesting. This uses two: products -> variants, products -> media. Adding a third connection
+# level would be rejected by Shopify rather than silently truncated.
+{
+  products {
+    edges {
+      node {
+        id
+        title
+        handle
+        description
+        status
+        productType
+        vendor
+        createdAt
+        updatedAt
+        options {
+          name
+          position
+          values
+        }
+        variants {
+          edges {
+            node {
+              id
+              title
+              sku
+              barcode
+              price
+              compareAtPrice
+              position
+              inventoryPolicy
+              selectedOptions {
+                name
+                value
+              }
+              inventoryItem {
+                id
+                measurement {
+                  weight {
+                    value
+                    unit
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

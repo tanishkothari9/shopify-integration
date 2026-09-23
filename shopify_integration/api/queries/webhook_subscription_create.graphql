@@ -1,0 +1,23 @@
+# $topic is a WebhookSubscriptionTopic enum member (ORDERS_CREATE), NOT the slash-form
+# topic that arrives in the X-Shopify-Topic header (orders/create). See api/webhooks.py.
+mutation webhookSubscriptionCreate(
+  $topic: WebhookSubscriptionTopic!
+  $webhookSubscription: WebhookSubscriptionInput!
+) {
+  webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+    webhookSubscription {
+      id
+      topic
+      endpoint {
+        __typename
+        ... on WebhookHttpEndpoint {
+          callbackUrl
+        }
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

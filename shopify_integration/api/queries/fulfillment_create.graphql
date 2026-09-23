@@ -1,0 +1,14 @@
+# Marks lines shipped in Shopify, which is what sends the customer their dispatch email.
+#
+# notifyCustomer is deliberately driven by the store's own setting: a shop importing a backlog
+# of already-delivered orders must not email every one of those customers again.
+mutation fulfillmentCreate($fulfillment: FulfillmentInput!) {
+  fulfillmentCreate(fulfillment: $fulfillment) {
+    fulfillment {
+      id
+      status
+      trackingInfo { number company url }
+    }
+    userErrors { field message }
+  }
+}

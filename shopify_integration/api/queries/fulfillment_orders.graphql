@@ -1,0 +1,26 @@
+# The fulfilment orders behind a Shopify order, with what is still owed on each line.
+#
+# Shopify does not let you fulfil an order directly any more: you fulfil against a
+# FulfillmentOrder, which is Shopify's own split of the order by location and status. An order
+# shipped from two warehouses has two of them, which is exactly the partial-shipment case a
+# Delivery Note produces.
+query fulfillmentOrders($id: ID!) {
+  order(id: $id) {
+    id
+    name
+    fulfillmentOrders(first: 20) {
+      nodes {
+        id
+        status
+        assignedLocation { location { id } }
+        lineItems(first: 250) {
+          nodes {
+            id
+            remainingQuantity
+            lineItem { id sku variant { id } }
+          }
+        }
+      }
+    }
+  }
+}

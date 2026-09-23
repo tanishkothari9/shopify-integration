@@ -1,0 +1,17 @@
+# groupObjects is REQUIRED as of recent API versions. We pass false deliberately:
+# Shopify warns that grouping "can slow down operations and increase the risk of timeouts",
+# and a 50,000-product catalogue is exactly where a timeout is unaffordable. False gives the
+# flat JSONL where variants are separate lines carrying __parentId, which api/bulk.py buffers.
+mutation bulkOperationRunQuery($groupObjects: Boolean!, $query: String!) {
+  bulkOperationRunQuery(groupObjects: $groupObjects, query: $query) {
+    bulkOperation {
+      id
+      status
+      createdAt
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

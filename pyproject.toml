@@ -1,0 +1,44 @@
+[project]
+name = "shopify_integration"
+authors = [{ name = "Tanish Kothari", email = "tanishkothari324@gmail.com" }]
+description = "Multi-store, GraphQL-first Shopify integration for ERPNext with real-time inventory."
+requires-python = ">=3.10,<3.15"
+readme = "README.md"
+dynamic = ["version"]
+license = { text = "GPL-3.0-or-later" }
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/tanishkothari9/shopify-integration"
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.flit.module]
+name = "shopify_integration"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "RUF"]
+ignore = [
+    "W191",   # tabs are Frappe's house style, and what the formatter below emits
+    "E101",   # ditto: mixed indentation warning is noise under tab indent-style
+    "B904",   # raise-without-from inside except: Frappe's throw() is the idiom here
+    "E501",   # line length is handled by the formatter
+    "RUF001", # ambiguous unicode in docstrings/specs
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "tab"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true   # frappe/erpnext ship no type stubs
+disallow_untyped_defs = false
+warn_unused_ignores = true
+exclude = "(^|/)(tests)/"

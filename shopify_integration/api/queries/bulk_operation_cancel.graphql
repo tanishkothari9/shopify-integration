@@ -1,0 +1,12 @@
+mutation bulkOperationCancel($id: ID!) {
+  bulkOperationCancel(id: $id) {
+    bulkOperation {
+      id
+      status
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

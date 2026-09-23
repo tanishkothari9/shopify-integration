@@ -1,0 +1,22 @@
+# Creates the product shell. Shopify gives it one default variant, which the follow-up
+# productVariantsBulkUpdate then fills in with the SKU, price and inventory tracking --
+# productCreate cannot set those itself.
+mutation productCreate($product: ProductCreateInput!) {
+  productCreate(product: $product) {
+    product {
+      id
+      title
+      handle
+      status
+      variants(first: 1) {
+        nodes {
+          id
+          sku
+          price
+          inventoryItem { id }
+        }
+      }
+    }
+    userErrors { field message }
+  }
+}

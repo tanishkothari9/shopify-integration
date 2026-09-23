@@ -1,0 +1,22 @@
+# Existing subscriptions for this app on this shop. Registration is reconciled against
+# this list so that re-enabling a store does not create duplicate subscriptions.
+query webhookSubscriptions($cursor: String) {
+  webhookSubscriptions(first: 100, after: $cursor) {
+    edges {
+      node {
+        id
+        topic
+        endpoint {
+          __typename
+          ... on WebhookHttpEndpoint {
+            callbackUrl
+          }
+        }
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}

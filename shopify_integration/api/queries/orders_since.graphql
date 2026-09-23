@@ -1,0 +1,18 @@
+# Orders created since a point in time, for the order half of reconciliation (spec §12).
+# `query` uses Shopify's search syntax, e.g. "created_at:>=2026-09-01T00:00:00Z".
+query ordersSince($search: String!, $cursor: String) {
+  orders(first: 100, after: $cursor, query: $search, sortKey: CREATED_AT) {
+    edges {
+      node {
+        id
+        name
+        createdAt
+        cancelledAt
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}
