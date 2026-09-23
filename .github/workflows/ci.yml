@@ -28,17 +28,10 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
 
-      # The tests are not run here. They need no *site*, but they do import modules that
-      # import frappe, and frappe is not pip-installable in a bare runner. Installing it
-      # would make this job as slow as the integration one below, which already runs the
-      # whole suite against a real site -- twice. This job stays fast on purpose.
-
-      # The pure tests -- no database, no site. Everything that needs a Frappe site runs under
-      # `bench run-tests` in the integration job below, and is excluded here by name.
-      #
-      # Excluding the site-bound files (rather than listing the pure ones) is the safer way
-      # round: a new pure test file is picked up automatically, and a new site-bound one fails
-      # here loudly instead of being silently skipped.
+      # Tests are not run here. They need no *site*, but they do import modules that import
+      # frappe, which is not pip-installable in a bare runner. Installing it would make this
+      # job as slow as the integration one below, which already runs the whole suite against a
+      # real site -- twice. This job stays fast on purpose.
 
   integration:
     name: Integration tests (Frappe ${{ matrix.frappe-branch }})
@@ -101,6 +94,8 @@ jobs:
           bench new-site test.localhost \
             --mariadb-root-password root --admin-password admin \
             --no-mariadb-socket --install-app erpnext --install-app shopify_integration
+          # `bench run-tests` imports pytest, and `bench init` does not bring it into the venv
+          ./env/bin/pip install pytest
 
       - name: Run tests
         run: |
