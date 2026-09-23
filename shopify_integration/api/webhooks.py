@@ -78,50 +78,63 @@ def callback_url(site_url: str) -> str:
 	return f"{site_url.rstrip('/')}/api/method/{method}"
 
 
-def existing_subscriptions(client: ShopifyClient) -> dict[str, dict]:
-	"""Map slash-form topic -> subscription node, for subscriptions this app already owns.
+def existing_subscriptions(client: ShopifyClient) -> dict[str, list[dict]]:
+	"""Map slash-form topic -> every subscription this app owns for it.
+
+	A list, not a single node, because one topic can genuinely carry more than one.
+	``webhookSubscriptionCreate`` takes no idempotency key and the client retries, so a create
+	Shopify accepted but whose reply never arrived leaves a second subscription behind. Keeping
+	one node per topic hid those twins completely: ``register`` tidied the one it could see and
+	``unregister`` left the other posting at a dead endpoint, and neither could ever heal it.
+	Two subscriptions mean two deliveries with two webhook ids, which the event log's unique
+	``webhook_id`` does not collapse -- that only catches Shopify resending one delivery.
 
 	Shopify only ever returns the subscriptions belonging to the authenticated app, so this
 	cannot see or disturb another app's webhooks on the same shop.
 	"""
-	found: dict[str, dict] = {}
+	found: dict[str, list[dict]] = {}
 	for node in client.paginate(load_query("webhook_subscriptions"), {}, "webhookSubscriptions"):
-		found[to_header_topic(node.get("topic", ""))] = node
+		found.setdefault(to_header_topic(node.get("topic", "")), []).append(node)
 	return found
 
 
 def register(client: ShopifyClient, site_url: str, topics: tuple[str, ...] = REQUIRED_TOPICS) -> dict:
 	"""Ensure a subscription exists for every required topic, pointing at this site.
 
-	Reconciles rather than blindly creating: a subscription already pointing at the right
-	URL is left alone, and one pointing at a stale URL (a site that moved, or a tunnel that
-	was recreated during development) is replaced. Enabling a store twice is therefore a
-	no-op rather than a source of duplicate deliveries.
+	Reconciles rather than blindly creating: one subscription already pointing at the right
+	URL is kept, and everything else on that topic -- a stale URL from a site that moved or a
+	tunnel that was recreated, and any duplicate left by a retried create -- is deleted.
+	Enabling a store is therefore both a no-op when all is well and the cure when it is not.
 	"""
 	from shopify_integration.exceptions import ShopifyUserError
 
 	target = callback_url(site_url)
 	existing = existing_subscriptions(client)
-	created, replaced, unchanged, failed = [], [], [], []
+	created, replaced, unchanged, removed, failed = [], [], [], [], []
 
 	for topic in topics:
 		try:
-			current = existing.get(topic)
-			if current:
-				current_url = (current.get("endpoint") or {}).get("callbackUrl")
-				if current_url == target:
-					unchanged.append(topic)
+			current = existing.get(topic) or []
+			keep = next(
+				(node for node in current if (node.get("endpoint") or {}).get("callbackUrl") == target),
+				None,
+			)
+			for extra in current:
+				if extra is keep:
 					continue
-				client.execute(load_query("webhook_subscription_delete"), {"id": current["id"]}, cost_hint=10)
-				replaced.append(topic)
+				client.execute(load_query("webhook_subscription_delete"), {"id": extra["id"]}, cost_hint=10)
+				removed.append(topic)
+
+			if keep:
+				unchanged.append(topic)
+				continue
 
 			client.execute(
 				load_query("webhook_subscription_create"),
 				{"topic": to_graphql_topic(topic), "webhookSubscription": {"uri": target}},
 				cost_hint=10,
 			)
-			if topic not in replaced:
-				created.append(topic)
+			(replaced if current else created).append(topic)
 		except ShopifyUserError as exc:
 			# One topic Shopify refuses must not cost us the eleven it would accept. Order and
 			# customer topics need Protected Customer Data approval, which a new app does not
@@ -132,6 +145,7 @@ def register(client: ShopifyClient, site_url: str, topics: tuple[str, ...] = REQ
 		"created": created,
 		"replaced": replaced,
 		"unchanged": unchanged,
+		"removed": removed,
 		"failed": failed,
 		"callback_url": target,
 	}
@@ -142,9 +156,7 @@ def unregister(client: ShopifyClient, topics: tuple[str, ...] = REQUIRED_TOPICS)
 	existing = existing_subscriptions(client)
 	removed = []
 	for topic in topics:
-		node = existing.get(topic)
-		if not node:
-			continue
-		client.execute(load_query("webhook_subscription_delete"), {"id": node["id"]}, cost_hint=10)
-		removed.append(topic)
+		for node in existing.get(topic) or []:
+			client.execute(load_query("webhook_subscription_delete"), {"id": node["id"]}, cost_hint=10)
+			removed.append(topic)
 	return {"removed": removed}
