@@ -1,7 +1,10 @@
 """Webhook topics have two spellings and the app must not confuse them (spec §8.2)."""
 
+from unittest.mock import patch
+
 import pytest
 
+from shopify_integration.api import webhooks
 from shopify_integration.api.webhooks import (
 	REQUIRED_TOPICS,
 	callback_url,
@@ -69,17 +72,16 @@ def test_reverse_lookup_beats_the_heuristic_for_known_topics():
 # INVENTORY_LEVELS_UPDATE subscriptions, created seconds apart in one registration run.
 # --------------------------------------------------------------------------------------
 
-from unittest.mock import patch
-
-from shopify_integration.api import webhooks
-
 
 TARGET = "https://site.example.com/api/method/shopify_integration.inbound.webhook.webhook"
 
 
 def sub(sub_id, topic, url=TARGET):
-	return {"id": f"gid://shopify/WebhookSubscription/{sub_id}", "topic": topic,
-	        "endpoint": {"callbackUrl": url}}
+	return {
+		"id": f"gid://shopify/WebhookSubscription/{sub_id}",
+		"topic": topic,
+		"endpoint": {"callbackUrl": url},
+	}
 
 
 class _Client:
@@ -120,8 +122,12 @@ def test_a_duplicate_subscription_is_deleted_and_the_good_one_kept():
 
 
 def test_a_stale_duplicate_is_cleared_and_one_good_subscription_created():
-	client = _Client([sub(1, "ORDERS_CREATE", "https://old-tunnel.example.com/hook"),
-	                  sub(2, "ORDERS_CREATE", "https://older-tunnel.example.com/hook")])
+	client = _Client(
+		[
+			sub(1, "ORDERS_CREATE", "https://old-tunnel.example.com/hook"),
+			sub(2, "ORDERS_CREATE", "https://older-tunnel.example.com/hook"),
+		]
+	)
 	with patch.object(webhooks, "load_query", return_value="q"):
 		result = webhooks.register(client, "https://site.example.com", ("orders/create",))
 
