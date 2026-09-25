@@ -47,7 +47,10 @@ def mobile_from(shopify_customer: dict, order: dict | None = None) -> str | None
 	"""
 	candidates = [shopify_customer.get("phone")]
 	for key in ("shippingAddress", "billingAddress"):
-		candidates.append((order or {}).get(key, {}).get("phone") if order else None)
+		# ``or {}`` rather than a default, because Shopify sends the key present and null on an
+		# order with no such address, and a default only covers the key being absent.
+		address = (order or {}).get(key) or {}
+		candidates.append(address.get("phone"))
 
 	for candidate in candidates:
 		number = normalise_mobile(candidate)

@@ -65,6 +65,20 @@ class TestFindingTheNumber(FrappeTestCase):
 	def test_no_number_anywhere_is_none(self):
 		self.assertIsNone(mobile_from({"phone": ""}, {"shippingAddress": {"phone": None}}))
 
+	def test_an_address_that_is_present_and_null_does_not_crash(self):
+		"""Shopify sends the key with a null value on an order with no such address, so a dict
+		default never fires and ``None.get`` is what you actually hit."""
+		self.assertIsNone(mobile_from({"phone": None}, {"shippingAddress": None, "billingAddress": None}))
+		self.assertEqual(
+			mobile_from(
+				{"phone": None}, {"shippingAddress": None, "billingAddress": {"phone": "9800011122"}}
+			),
+			"9800011122",
+		)
+
+	def test_no_order_at_all_is_none(self):
+		self.assertIsNone(mobile_from({"phone": None}, None))
+
 
 class TestFindingTheCustomer(FrappeTestCase):
 	"""The lookup has to see numbers wherever ERPNext actually keeps them."""
