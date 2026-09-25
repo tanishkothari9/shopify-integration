@@ -24,7 +24,7 @@
   "column_break_erp",
   "default_customer",
   "customer_group",
-  "match_customers_by_mobile",
+  "match_existing_customers",
   "default_warehouse",
   "section_accounts",
   "selling_price_list",
@@ -179,11 +179,11 @@
    "description": "Group new Shopify customers land in. Leave blank to use Individual. Group-type nodes are not offered: ERPNext refuses them on a Customer."
   },
   {
-   "fieldname": "match_customers_by_mobile",
+   "fieldname": "match_existing_customers",
    "fieldtype": "Check",
-   "label": "Match Shopify Customers to Existing Ones by Mobile Number",
+   "label": "Match Shopify Buyers to Customers You Already Have",
    "default": "1",
-   "description": "A shopper who already buys from you in person signs up online with the same mobile number, sometimes under a shorter name. With this on, the order is booked against the customer you already have instead of a second record, and the two channels share one history. Matching compares the last 10 digits, so +91, spaces and a leading 0 do not matter. Turn it off if two genuinely different customers can share one number, such as a household or an office line."
+   "description": "A shopper who already buys from you at the counter signs up online, sometimes under a shorter name. With this on, the order is booked against the customer you already have instead of a second record, so the two channels share one history. The buyer's own mobile is tried first, compared on the last 10 digits so +91, spaces and a leading 0 do not matter, then their email. Address phone numbers are never used -- they are as often a receptionist or the person a gift is going to. Turn it off if two genuinely different customers can share a number or an address, such as a household or an office."
   },
   {
    "fieldname": "default_warehouse",

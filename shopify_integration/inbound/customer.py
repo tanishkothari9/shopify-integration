@@ -21,10 +21,11 @@ from frappe.utils import cstr
 from shopify_integration.catalogue.echo import inbound_write, mark
 from shopify_integration.inbound.webhook import payload_of
 
-#: A number shared by more than this many customers is a placeholder -- a shop's own landline,
-#: or the 9999999999 staff type to get past a required field -- not one person. Matching on it
-#: would merge every online shopper onto one record, which is far worse than a duplicate.
-MAX_CUSTOMERS_PER_MOBILE = 3
+#: An identifier on more than this many customers is a placeholder, not a person -- a shop's
+#: own landline, the 9999999999 typed past a required field, or info@ on a company account.
+#: Matching on one would merge every online shopper onto a single record, far worse than a
+#: duplicate, so past this count we decline to match at all.
+MAX_CUSTOMERS_PER_IDENTIFIER = 3
 
 
 def normalise_mobile(raw) -> str | None:
@@ -39,24 +40,50 @@ def normalise_mobile(raw) -> str | None:
 	return digits[-10:] if len(digits) >= 10 else None
 
 
-def mobile_from(shopify_customer: dict, order: dict | None = None) -> str | None:
-	"""The buyer's mobile, wherever Shopify put it.
+def normalise_email(raw) -> str | None:
+	"""An email lowercased and trimmed, or None if it is not one.
 
-	Shopify often leaves the customer record's phone empty and carries the number on the
-	address instead, so the addresses are checked too rather than giving up on the first miss.
+	Strict enough that a fragment cannot become a matching key: ``@gmail.com`` has an at-sign
+	and a dotted domain but no person in front of it, and matching customers on it would put
+	every buyer who left the field half-filled onto one record.
 	"""
-	candidates = [shopify_customer.get("phone")]
-	for key in ("shippingAddress", "billingAddress"):
-		# ``or {}`` rather than a default, because Shopify sends the key present and null on an
-		# order with no such address, and a default only covers the key being absent.
-		address = (order or {}).get(key) or {}
-		candidates.append(address.get("phone"))
+	email = cstr(raw).strip().lower()
+	if email.count("@") != 1:
+		return None
+	local, _, domain = email.partition("@")
+	if not local or not domain or domain.startswith(".") or domain.endswith("."):
+		return None
+	return email if "." in domain else None
 
-	for candidate in candidates:
-		number = normalise_mobile(candidate)
-		if number:
-			return number
-	return None
+
+def customer_mobile(shopify_customer: dict) -> str | None:
+	"""The buyer's own mobile.
+
+	Deliberately *only* the customer record's phone. The number on a shipping or billing
+	address is not reliably the buyer -- it is as often a receptionist, a neighbour taking
+	delivery, or the person a gift is going to -- and matching a customer on it merges people
+	who never met.
+	"""
+	return normalise_mobile(shopify_customer.get("phone"))
+
+
+def customer_email(shopify_customer: dict) -> str | None:
+	return normalise_email(shopify_customer.get("email"))
+
+
+def _matched(customers: list[str], identifier: str, kind: str) -> str | None:
+	"""One customer from a match, or None when the identifier is too common to trust."""
+	customers = [customer for customer in customers if customer]
+	if not customers:
+		return None
+	if len(customers) > MAX_CUSTOMERS_PER_IDENTIFIER:
+		frappe.logger("shopify_integration").warning(
+			f"{kind} {identifier} is on {len(customers)} customers; treating it as a placeholder "
+			"and not matching on it."
+		)
+		return None
+	# Oldest wins: the record carrying the longest history is the one worth keeping.
+	return customers[0] if len(customers) == 1 else _oldest(customers)
 
 
 def find_customer_by_mobile(number: str) -> str | None:
@@ -66,10 +93,10 @@ def find_customer_by_mobile(number: str) -> str | None:
 	field fetched from the primary contact, so it is empty on every customer that has no
 	primary contact set -- which, on a real site, is most of them. The contact's own phone rows
 	are where the number actually lives, so they are the authority and the customer field is
-	the cheap first look.
+	the cheap first look. ERPNext's own POS writes both, which is what lets a counter sale and
+	a web order find each other.
 
-	The comparison is on the last 10 digits, done in SQL so it stays one indexed-ish scan
-	rather than pulling every contact into Python.
+	Compared on the last 10 digits, in SQL, so one query does the whole catalogue.
 	"""
 	if not number:
 		return None
@@ -93,18 +120,40 @@ def find_customer_by_mobile(number: str) -> str | None:
 		{"number": number},
 		as_dict=True,
 	)
-	customers = [row.customer for row in matches if row.customer]
+	return _matched([row.customer for row in matches], number, "Mobile")
 
-	if not customers:
+
+def find_customer_by_email(email: str) -> str | None:
+	"""An existing Customer reachable at this email, or None.
+
+	The weaker of the two keys, and only ever tried after the mobile finds nobody: a household
+	shares an email far more readily than a mobile, and a company account's info@ address would
+	otherwise sweep every buyer from that company onto one record. The placeholder guard is
+	what stops that becoming a silent merge.
+	"""
+	if not email:
 		return None
-	if len(customers) > MAX_CUSTOMERS_PER_MOBILE:
-		frappe.logger("shopify_integration").warning(
-			f"Mobile ending {number[-4:]} is on {len(customers)} customers; treating it as a "
-			"placeholder and not matching on it."
-		)
-		return None
-	# Oldest wins: the record with the longest history is the one worth keeping.
-	return sorted(customers)[0] if len(customers) == 1 else _oldest(customers)
+
+	matches = frappe.db.sql(
+		"""
+		SELECT DISTINCT link.link_name AS customer
+		FROM `tabContact Email` mail
+		JOIN `tabDynamic Link` link
+		  ON link.parent = mail.parent
+		 AND link.parenttype = 'Contact'
+		 AND link.link_doctype = 'Customer'
+		WHERE LOWER(TRIM(mail.email_id)) = %(email)s
+
+		UNION
+
+		SELECT name AS customer
+		FROM `tabCustomer`
+		WHERE LOWER(TRIM(IFNULL(email_id, ''))) = %(email)s
+		""",
+		{"email": email},
+		as_dict=True,
+	)
+	return _matched([row.customer for row in matches], email, "Email")
 
 
 def _oldest(customers: list[str]) -> str | None:
@@ -136,18 +185,14 @@ def resolve_customer(store_doc, order: dict) -> str:
 
 	existing = frappe.db.get_value("Customer", {"shopify_customer_gid": gid}, "name")
 
-	if not existing and store_doc.get("match_customers_by_mobile"):
-		# Second key: the buyer already shops here in person. Their Shopify GID is new, but
-		# their mobile is not. Claiming the record -- stamping this GID on it -- is what makes
-		# the match happen once rather than on every future order.
-		number = mobile_from(shopify_customer, order)
-		if number:
-			existing = find_customer_by_mobile(number)
-			if existing:
-				frappe.db.set_value("Customer", existing, "shopify_customer_gid", gid, update_modified=False)
-				frappe.logger("shopify_integration").info(
-					f"Matched Shopify customer {gid} to existing {existing} on mobile ending {number[-4:]}"
-				)
+	if not existing and store_doc.get("match_existing_customers"):
+		existing = _match_existing(shopify_customer)
+		if existing:
+			# Claiming the record -- stamping this GID on it -- is what makes the search happen
+			# once per person rather than once per order.
+			frappe.db.set_value("Customer", existing, "shopify_customer_gid", gid, update_modified=False)
+			with inbound_write():
+				enrich_contact(existing, shopify_customer)
 
 	if existing:
 		# Shopify fires customers/create a fraction of a second before orders/create, so by the
@@ -175,9 +220,92 @@ def resolve_customer(store_doc, order: dict) -> str:
 
 		_write_address(customer.name, order.get("shippingAddress"), "Shipping")
 		_write_address(customer.name, order.get("billingAddress"), "Billing")
-		_write_contact(customer.name, shopify_customer, order)
+		_write_contact(customer.name, shopify_customer)
 
 	return customer.name
+
+
+def _match_existing(shopify_customer: dict) -> str | None:
+	"""The customer this buyer already is, found by mobile and then by email.
+
+	Mobile first because it is the stronger claim, and because it is the one your counter staff
+	actually collect. Email is tried only when the mobile finds nobody.
+
+	When the two disagree -- the mobile points at one customer and the email at another -- the
+	mobile wins and the clash is logged rather than resolved. Two records that each match on a
+	different identifier are two records a human should look at; welding them together on a
+	guess is the one outcome worse than a duplicate.
+	"""
+	number = customer_mobile(shopify_customer)
+	email = customer_email(shopify_customer)
+
+	by_mobile = find_customer_by_mobile(number) if number else None
+	by_email = find_customer_by_email(email) if email else None
+
+	if by_mobile and by_email and by_mobile != by_email:
+		frappe.logger("shopify_integration").warning(
+			f"Shopify buyer matches {by_mobile} on mobile and {by_email} on email. Using the "
+			f"mobile match; the two records may be the same person and worth merging by hand."
+		)
+		return by_mobile
+
+	matched = by_mobile or by_email
+	if matched:
+		found_on = "mobile" if by_mobile else "email"
+		frappe.logger("shopify_integration").info(
+			f"Matched Shopify buyer to existing customer {matched} on {found_on}"
+		)
+	return matched
+
+
+def enrich_contact(customer: str, shopify_customer: dict) -> None:
+	"""Add the identifier the existing record was missing. Never overwrite one it has.
+
+	A walk-in matched on their mobile often arrives with the email nobody ever asked them for
+	at the counter, and vice versa. Adding it is what lets the *next* order match even when the
+	shopper gives only the other one -- the two channels teach each other who this person is.
+
+	Only ever appends. A value your staff typed is never replaced by one from Shopify.
+	"""
+	email = customer_email(shopify_customer)
+	number = customer_mobile(shopify_customer)
+	if not email and not number:
+		return
+
+	contact_name = (
+		frappe.db.get_value("Customer", customer, "customer_primary_contact")
+		or (
+			frappe.get_all(
+				"Contact",
+				filters=[
+					["Dynamic Link", "link_name", "=", customer],
+					["Dynamic Link", "link_doctype", "=", "Customer"],
+				],
+				order_by="creation asc",
+				limit=1,
+				pluck="name",
+			)
+			or [None]
+		)[0]
+	)
+	if not contact_name:
+		_write_contact(customer, shopify_customer)
+		return
+
+	contact = frappe.get_doc("Contact", contact_name)
+	changed = False
+
+	if email and not any(normalise_email(row.email_id) == email for row in contact.email_ids):
+		contact.append("email_ids", {"email_id": cstr(shopify_customer.get("email")).strip()})
+		changed = True
+
+	if number and not any(normalise_mobile(row.phone) == number for row in contact.phone_nos):
+		contact.append("phone_nos", {"phone": cstr(shopify_customer.get("phone")).strip()})
+		changed = True
+
+	if changed:
+		mark(contact)
+		contact.save(ignore_permissions=True)
 
 
 def customer_name(shopify_customer: dict, order: dict | None = None) -> str:
@@ -277,23 +405,15 @@ def _country(address: dict) -> str:
 	return frappe.db.get_default("country") or "United States"
 
 
-def _write_contact(customer: str, shopify_customer: dict, order: dict | None = None) -> str | None:
-	"""The person behind the customer: their email, and the number we will find them by.
+def _write_contact(customer: str, shopify_customer: dict) -> str | None:
+	"""The person behind the customer: their email, and the number they are found by.
 
-	The phone falls back to the order's addresses for the same reason ``mobile_from`` reads
-	them -- Shopify frequently leaves the customer record's phone empty and carries the number
-	on the address. Storing only the customer-level phone meant the matcher looked in three
-	places but we recorded one, so a buyer found by their shipping-address number was saved
-	without it and could not be found again.
+	Only the buyer's own phone and email. An address phone is not reliably the buyer -- it is
+	as often a receptionist, a neighbour taking delivery, or the person a gift is going to --
+	and recording it here would have the next order match the wrong human entirely.
 	"""
 	email = cstr(shopify_customer.get("email")).strip()
 	phone = cstr(shopify_customer.get("phone")).strip()
-	if not phone and order:
-		for key in ("shippingAddress", "billingAddress"):
-			candidate = cstr((order.get(key) or {}).get("phone")).strip()
-			if candidate:
-				phone = candidate
-				break
 	if not email and not phone:
 		return None
 
