@@ -133,3 +133,72 @@ class TestFindingTheCustomer(FrappeTestCase):
 			customer = self._customer(f"ZZ Placeholder {index}")
 			self._contact_with_phone(customer, "9999999999")
 		self.assertIsNone(find_customer_by_mobile("9999999999"))
+
+
+class TestStoringTheNumberWeWillLookFor(FrappeTestCase):
+	"""What the matcher searches and what the writer records have to be the same three places.
+
+	They were not: ``mobile_from`` read the customer's phone and both addresses, while
+	``_write_contact`` stored only the customer's. A buyer whose number Shopify keeps on the
+	shipping address was therefore saved without one and could never be matched again.
+	"""
+
+	def setUp(self):
+		self.made = []
+
+	def tearDown(self):
+		for doctype, name in reversed(self.made):
+			frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, ignore_missing=True)
+		frappe.db.commit()
+
+	def _customer(self, name):
+		doc = frappe.new_doc("Customer")
+		doc.customer_name = name
+		doc.customer_group = frappe.get_all("Customer Group", filters={"is_group": 0}, limit=1, pluck="name")[
+			0
+		]
+		doc.territory = frappe.get_all("Territory", filters={"is_group": 0}, limit=1, pluck="name")[0]
+		doc.insert(ignore_permissions=True)
+		self.made.append(("Customer", doc.name))
+		return doc.name
+
+	def test_an_address_only_number_is_still_recorded_on_the_contact(self):
+		from shopify_integration.inbound.customer import _write_contact
+
+		customer = self._customer("ZZ Address Phone Only")
+		contact = _write_contact(
+			customer,
+			{"firstName": "Meena", "lastName": "R", "email": "meena@example.com", "phone": None},
+			{"shippingAddress": {"phone": "+91 98000 33344"}, "billingAddress": None},
+		)
+		self.made.append(("Contact", contact))
+		self.assertIsNotNone(contact)
+		phones = frappe.get_all("Contact Phone", filters={"parent": contact}, pluck="phone")
+		self.assertEqual(phones, ["+91 98000 33344"])
+
+	def test_that_customer_can_then_be_found_by_that_number(self):
+		"""The round trip: what we wrote is what the matcher finds."""
+		from shopify_integration.inbound.customer import _write_contact
+
+		customer = self._customer("ZZ Round Trip")
+		contact = _write_contact(
+			customer,
+			{"firstName": "Meena", "email": "roundtrip@example.com"},
+			{"shippingAddress": {"phone": "09800044455"}},
+		)
+		self.made.append(("Contact", contact))
+		frappe.db.commit()
+		self.assertEqual(find_customer_by_mobile("9800044455"), customer)
+
+	def test_the_customers_own_phone_is_still_preferred(self):
+		from shopify_integration.inbound.customer import _write_contact
+
+		customer = self._customer("ZZ Own Phone Wins")
+		contact = _write_contact(
+			customer,
+			{"firstName": "Arun", "email": "arun@example.com", "phone": "9800055566"},
+			{"shippingAddress": {"phone": "9800066677"}},
+		)
+		self.made.append(("Contact", contact))
+		phones = frappe.get_all("Contact Phone", filters={"parent": contact}, pluck="phone")
+		self.assertEqual(phones, ["9800055566"])

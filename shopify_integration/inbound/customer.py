@@ -117,8 +117,10 @@ def _oldest(customers: list[str]) -> str | None:
 def resolve_customer(store_doc, order: dict) -> str:
 	"""The ERPNext Customer for an order, creating one if this buyer is new.
 
-	Matching is on the Shopify GID rather than on email: a shopper can change their email,
-	and two different people can share one (a household, a company address).
+	Two keys, in order. The Shopify GID first: it is exact, and unlike an email it cannot be
+	changed by the shopper or shared by a household. Then, where the store allows it, the
+	mobile number -- which is what recognises a buyer who already shops here in person and has
+	just signed up online for the first time.
 	"""
 	shopify_customer = order.get("customer") or {}
 	gid = cstr(shopify_customer.get("id"))
@@ -173,7 +175,7 @@ def resolve_customer(store_doc, order: dict) -> str:
 
 		_write_address(customer.name, order.get("shippingAddress"), "Shipping")
 		_write_address(customer.name, order.get("billingAddress"), "Billing")
-		_write_contact(customer.name, shopify_customer)
+		_write_contact(customer.name, shopify_customer, order)
 
 	return customer.name
 
@@ -275,9 +277,23 @@ def _country(address: dict) -> str:
 	return frappe.db.get_default("country") or "United States"
 
 
-def _write_contact(customer: str, shopify_customer: dict) -> str | None:
+def _write_contact(customer: str, shopify_customer: dict, order: dict | None = None) -> str | None:
+	"""The person behind the customer: their email, and the number we will find them by.
+
+	The phone falls back to the order's addresses for the same reason ``mobile_from`` reads
+	them -- Shopify frequently leaves the customer record's phone empty and carries the number
+	on the address. Storing only the customer-level phone meant the matcher looked in three
+	places but we recorded one, so a buyer found by their shipping-address number was saved
+	without it and could not be found again.
+	"""
 	email = cstr(shopify_customer.get("email")).strip()
 	phone = cstr(shopify_customer.get("phone")).strip()
+	if not phone and order:
+		for key in ("shippingAddress", "billingAddress"):
+			candidate = cstr((order.get(key) or {}).get("phone")).strip()
+			if candidate:
+				phone = candidate
+				break
 	if not email and not phone:
 		return None
 
