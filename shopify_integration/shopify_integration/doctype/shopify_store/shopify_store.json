@@ -24,6 +24,7 @@
   "column_break_erp",
   "default_customer",
   "customer_group",
+  "match_customers_by_mobile",
   "default_warehouse",
   "section_accounts",
   "selling_price_list",
@@ -176,6 +177,13 @@
    "options": "Customer Group",
    "link_filters": "[[\"Customer Group\",\"is_group\",\"=\",0]]",
    "description": "Group new Shopify customers land in. Leave blank to use Individual. Group-type nodes are not offered: ERPNext refuses them on a Customer."
+  },
+  {
+   "fieldname": "match_customers_by_mobile",
+   "fieldtype": "Check",
+   "label": "Match Shopify Customers to Existing Ones by Mobile Number",
+   "default": "1",
+   "description": "A shopper who already buys from you in person signs up online with the same mobile number, sometimes under a shorter name. With this on, the order is booked against the customer you already have instead of a second record, and the two channels share one history. Matching compares the last 10 digits, so +91, spaces and a leading 0 do not matter. Turn it off if two genuinely different customers can share one number, such as a household or an office line."
   },
   {
    "fieldname": "default_warehouse",

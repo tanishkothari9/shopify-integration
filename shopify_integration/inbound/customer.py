@@ -4,6 +4,12 @@ The one rule that matters: never create two ERPNext Customers for the same Shopi
 GID. Duplicates here are not cosmetic -- they split a buyer's history across two ledgers and
 are painful to merge after the fact.
 
+The GID only recognises someone who has bought here online before. A shopper who already buys
+from you in person and then signs up on the website is a *new* Shopify customer with a fresh
+GID, so matching on the GID alone books them a second ERPNext record and splits the very
+history this module exists to keep together. Where a store says so, the mobile number is used
+as the second key -- see ``find_customer_by_mobile``.
+
 Guest checkouts carry no customer at all, and fall back to the store's default customer.
 """
 
@@ -14,6 +20,95 @@ from frappe.utils import cstr
 
 from shopify_integration.catalogue.echo import inbound_write, mark
 from shopify_integration.inbound.webhook import payload_of
+
+#: A number shared by more than this many customers is a placeholder -- a shop's own landline,
+#: or the 9999999999 staff type to get past a required field -- not one person. Matching on it
+#: would merge every online shopper onto one record, which is far worse than a duplicate.
+MAX_CUSTOMERS_PER_MOBILE = 3
+
+
+def normalise_mobile(raw) -> str | None:
+	"""The last 10 digits of a phone number, or None if there are not 10.
+
+	One person's number reaches us spelled a dozen ways -- ``+919800011122``, ``09800011122``,
+	``+91 98000 11122``, ``98000-11122`` -- and ERPNext stores whatever was typed. Comparing the
+	last 10 digits is what makes those the same number. Ten because that is an Indian mobile;
+	the country code and any trunk prefix sit in front of it.
+	"""
+	digits = "".join(character for character in cstr(raw) if character.isdigit())
+	return digits[-10:] if len(digits) >= 10 else None
+
+
+def mobile_from(shopify_customer: dict, order: dict | None = None) -> str | None:
+	"""The buyer's mobile, wherever Shopify put it.
+
+	Shopify often leaves the customer record's phone empty and carries the number on the
+	address instead, so the addresses are checked too rather than giving up on the first miss.
+	"""
+	candidates = [shopify_customer.get("phone")]
+	for key in ("shippingAddress", "billingAddress"):
+		candidates.append((order or {}).get(key, {}).get("phone") if order else None)
+
+	for candidate in candidates:
+		number = normalise_mobile(candidate)
+		if number:
+			return number
+	return None
+
+
+def find_customer_by_mobile(number: str) -> str | None:
+	"""An existing Customer reachable on this mobile, or None.
+
+	Both places ERPNext keeps a number are searched. ``Customer.mobile_no`` is a read-only
+	field fetched from the primary contact, so it is empty on every customer that has no
+	primary contact set -- which, on a real site, is most of them. The contact's own phone rows
+	are where the number actually lives, so they are the authority and the customer field is
+	the cheap first look.
+
+	The comparison is on the last 10 digits, done in SQL so it stays one indexed-ish scan
+	rather than pulling every contact into Python.
+	"""
+	if not number:
+		return None
+
+	matches = frappe.db.sql(
+		"""
+		SELECT DISTINCT link.link_name AS customer
+		FROM `tabContact Phone` phone
+		JOIN `tabDynamic Link` link
+		  ON link.parent = phone.parent
+		 AND link.parenttype = 'Contact'
+		 AND link.link_doctype = 'Customer'
+		WHERE RIGHT(REGEXP_REPLACE(phone.phone, '[^0-9]', ''), 10) = %(number)s
+
+		UNION
+
+		SELECT name AS customer
+		FROM `tabCustomer`
+		WHERE RIGHT(REGEXP_REPLACE(IFNULL(mobile_no, ''), '[^0-9]', ''), 10) = %(number)s
+		""",
+		{"number": number},
+		as_dict=True,
+	)
+	customers = [row.customer for row in matches if row.customer]
+
+	if not customers:
+		return None
+	if len(customers) > MAX_CUSTOMERS_PER_MOBILE:
+		frappe.logger("shopify_integration").warning(
+			f"Mobile ending {number[-4:]} is on {len(customers)} customers; treating it as a "
+			"placeholder and not matching on it."
+		)
+		return None
+	# Oldest wins: the record with the longest history is the one worth keeping.
+	return sorted(customers)[0] if len(customers) == 1 else _oldest(customers)
+
+
+def _oldest(customers: list[str]) -> str | None:
+	rows = frappe.get_all(
+		"Customer", filters={"name": ["in", customers]}, fields=["name"], order_by="creation asc", limit=1
+	)
+	return rows[0].name if rows else None
 
 
 def resolve_customer(store_doc, order: dict) -> str:
@@ -35,6 +130,20 @@ def resolve_customer(store_doc, order: dict) -> str:
 		return store_doc.default_customer
 
 	existing = frappe.db.get_value("Customer", {"shopify_customer_gid": gid}, "name")
+
+	if not existing and store_doc.get("match_customers_by_mobile"):
+		# Second key: the buyer already shops here in person. Their Shopify GID is new, but
+		# their mobile is not. Claiming the record -- stamping this GID on it -- is what makes
+		# the match happen once rather than on every future order.
+		number = mobile_from(shopify_customer, order)
+		if number:
+			existing = find_customer_by_mobile(number)
+			if existing:
+				frappe.db.set_value("Customer", existing, "shopify_customer_gid", gid, update_modified=False)
+				frappe.logger("shopify_integration").info(
+					f"Matched Shopify customer {gid} to existing {existing} on mobile ending {number[-4:]}"
+				)
+
 	if existing:
 		# Shopify fires customers/create a fraction of a second before orders/create, so by the
 		# time an order is handled its buyer usually exists already -- created from a customer
@@ -176,10 +285,24 @@ def _write_contact(customer: str, shopify_customer: dict) -> str | None:
 	if email:
 		doc.append("email_ids", {"email_id": email, "is_primary": 1})
 	if phone:
-		doc.append("phone_nos", {"phone": phone, "is_primary_phone": 1})
+		# is_primary_mobile_no, not just is_primary_phone. ``Customer.mobile_no`` is a read-only
+		# field fetched from the primary contact's *mobile*, so marking it only as the primary
+		# phone leaves the customer's mobile blank for ever -- which is why no customer this app
+		# created could be found by number.
+		doc.append("phone_nos", {"phone": phone, "is_primary_phone": 1, "is_primary_mobile_no": 1})
 	doc.append("links", {"link_doctype": "Customer", "link_name": customer})
 	mark(doc)
 	doc.insert(ignore_permissions=True)
+
+	# Without a primary contact there is nothing for ``mobile_no`` to be fetched from. Only set
+	# when the customer has none, so a contact chosen by hand is never quietly replaced.
+	if phone and not frappe.db.get_value("Customer", customer, "customer_primary_contact"):
+		frappe.db.set_value(
+			"Customer",
+			customer,
+			{"customer_primary_contact": doc.name, "mobile_no": phone},
+			update_modified=False,
+		)
 	return doc.name
 
 
