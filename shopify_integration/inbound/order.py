@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import frappe
 from frappe import _
-from frappe.utils import cstr, get_datetime
+from frappe.utils import cstr
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import inbound_write, mark
@@ -38,6 +38,7 @@ from shopify_integration.utils.taxes import (
 	shipping_titles,
 	unit_rate,
 )
+from shopify_integration.utils.timestamps import shopify_date, shopify_time
 
 #: Shopify financial statuses that mean money has actually arrived.
 PAID_STATUSES = ("PAID", "PARTIALLY_PAID")
@@ -328,7 +329,7 @@ def create_sales_order(store_doc, order: dict) -> str:
 		so.shopify_order_number = cstr(order.get("name"))
 		so.currency = currency
 		so.conversion_rate = to_float(rate)
-		so.transaction_date = get_datetime(order.get("createdAt")).date()
+		so.transaction_date = shopify_date(order.get("createdAt"))
 		so.delivery_date = so.transaction_date
 		so.set_warehouse = store_doc.default_warehouse
 
@@ -547,7 +548,9 @@ def create_sales_invoice(store_doc, order: dict) -> dict:
 		si.shopify_store = store_doc.name
 		si.shopify_order_gid = order_gid
 		si.set_posting_time = 1
-		si.posting_date = get_datetime(order.get("processedAt") or order.get("createdAt")).date()
+		paid_at = order.get("processedAt") or order.get("createdAt")
+		si.posting_date = shopify_date(paid_at)
+		si.posting_time = shopify_time(paid_at)
 		si.ignore_pricing_rule = 1
 		if store_doc.sales_invoice_series:
 			si.naming_series = store_doc.sales_invoice_series
@@ -647,7 +650,9 @@ def _create_delivery_note(store_doc, order: dict, so_name: str, fulfilment: dict
 		dn.shopify_order_gid = order["id"]
 		dn.shopify_fulfillment_gid = cstr(fulfilment.get("id"))
 		dn.set_posting_time = 1
-		dn.posting_date = get_datetime(fulfilment.get("createdAt") or order.get("createdAt")).date()
+		shipped_at = fulfilment.get("createdAt") or order.get("createdAt")
+		dn.posting_date = shopify_date(shipped_at)
+		dn.posting_time = shopify_time(shipped_at)
 		if store_doc.delivery_note_series:
 			dn.naming_series = store_doc.delivery_note_series
 

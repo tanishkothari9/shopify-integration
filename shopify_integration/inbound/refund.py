@@ -29,7 +29,7 @@ from decimal import Decimal
 
 import frappe
 from frappe import _
-from frappe.utils import cstr, flt, get_datetime
+from frappe.utils import cstr, flt
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import inbound_write, mark
@@ -41,6 +41,7 @@ from shopify_integration.utils.taxes import (
 	money_field,
 	money_side_for,
 )
+from shopify_integration.utils.timestamps import shopify_date, shopify_time
 
 #: restockType values that mean the units come back into inventory. Anything else -- in
 #: practice NO_RESTOCK -- means the goods are gone even though the money is returned.
@@ -220,7 +221,8 @@ def _build_return_invoice(store_doc, refund: dict, invoice_name: str, quantities
 		# the credit note points at, leaving the whole order uncancellable.
 		credit_note.shopify_order_gid = (refund.get("order") or {}).get("id")
 		credit_note.set_posting_time = 1
-		credit_note.posting_date = get_datetime(refund.get("createdAt")).date()
+		credit_note.posting_date = shopify_date(refund.get("createdAt"))
+		credit_note.posting_time = shopify_time(refund.get("createdAt"))
 		credit_note.ignore_pricing_rule = 1
 		# Stock is handled separately, by a return Delivery Note when the goods actually
 		# shipped. Letting the credit note move stock as well would double the movement.
@@ -511,7 +513,11 @@ def _restock(store_doc, refund: dict, order_gid: str | None, quantities: dict) -
 		doc.shopify_store = store_doc.name
 		doc.shopify_order_gid = order_gid
 		doc.set_posting_time = 1
-		doc.posting_date = get_datetime(refund.get("createdAt")).date()
+		# The time matters as much as the date here. ``make_return_doc`` copies the original
+		# Delivery Note's posting time, so a same-day return would claim to have happened at the
+		# moment of despatch -- and ERPNext refuses a return that is not after what it returns.
+		doc.posting_date = shopify_date(refund.get("createdAt"))
+		doc.posting_time = shopify_time(refund.get("createdAt"))
 
 		# Drawn down per row, for the same reason as the credit note above: one item across two
 		# delivery lines would otherwise be restocked twice, and ERPNext would refuse the whole
