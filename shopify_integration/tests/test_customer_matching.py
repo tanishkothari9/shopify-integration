@@ -196,3 +196,54 @@ class TestWritingANewCustomersContact(_CustomerCase):
 		frappe.db.commit()
 		self.assertEqual(frappe.db.get_value("Customer", customer, "customer_primary_contact"), contact)
 		self.assertTrue(frappe.db.get_value("Customer", customer, "mobile_no"))
+
+
+class TestEnrichingACustomerWithNoPrimaryContact(_CustomerCase):
+	"""The branch that only runs when `customer_primary_contact` is empty.
+
+	Most customers on a real site have no primary contact -- ERPNext only sets it when
+	something goes out of its way to -- so this is the common path, not the rare one. It was
+	also the untested one: filtering Contact on Dynamic Link joins that table, and both carry a
+	`creation` column, so ordering by a bare `creation` is rejected as ambiguous.
+	"""
+
+	def _contact_without_making_it_primary(self, customer, phone=None, email=None):
+		doc = frappe.new_doc("Contact")
+		doc.first_name = f"{customer} contact"[:140]
+		if phone:
+			doc.append("phone_nos", {"phone": phone, "is_primary_mobile_no": 1})
+		if email:
+			doc.append("email_ids", {"email_id": email, "is_primary": 1})
+		doc.append("links", {"link_doctype": "Customer", "link_name": customer})
+		doc.insert(ignore_permissions=True)
+		self.made.append(("Contact", doc.name))
+		frappe.db.commit()
+		return doc.name
+
+	def test_the_oldest_linked_contact_is_found_when_none_is_primary(self):
+		customer = self.customer("ZZ No Primary Contact")
+		first = self._contact_without_making_it_primary(customer, phone="9800021111")
+		self._contact_without_making_it_primary(customer, phone="9800022222")
+		self.assertFalse(frappe.db.get_value("Customer", customer, "customer_primary_contact"))
+
+		enrich_contact(customer, {"phone": "9800021111", "email": "nopri@example.com"})
+		frappe.db.commit()
+
+		emails = frappe.get_all("Contact Email", filters={"parent": first}, pluck="email_id")
+		self.assertIn("nopri@example.com", emails)
+		self.assertEqual(find_customer_by_email("nopri@example.com"), customer)
+
+	def test_a_customer_with_no_contact_at_all_gets_one(self):
+		customer = self.customer("ZZ No Contact At All")
+		enrich_contact(customer, {"firstName": "Sunita", "phone": "9800023333", "email": "none@example.com"})
+		frappe.db.commit()
+		for name in frappe.get_all(
+			"Contact",
+			filters=[
+				["Dynamic Link", "link_name", "=", customer],
+				["Dynamic Link", "link_doctype", "=", "Customer"],
+			],
+			pluck="name",
+		):
+			self.made.append(("Contact", name))
+		self.assertEqual(find_customer_by_mobile("9800023333"), customer)

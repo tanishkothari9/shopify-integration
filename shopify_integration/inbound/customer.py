@@ -281,7 +281,10 @@ def enrich_contact(customer: str, shopify_customer: dict) -> None:
 					["Dynamic Link", "link_name", "=", customer],
 					["Dynamic Link", "link_doctype", "=", "Customer"],
 				],
-				order_by="creation asc",
+				# Qualified: filtering on Dynamic Link makes Frappe join `tabDynamic Link`, and
+				# both tables carry a `creation` column, so a bare one is rejected outright --
+				# "Column 'creation' in ORDER BY is ambiguous".
+				order_by="`tabContact`.creation asc",
 				limit=1,
 				pluck="name",
 			)
