@@ -40,13 +40,32 @@ class ShopifyEventLog(Document):
 		)
 		return {"status": "Queued"}
 
-	def mark_success(self, ref_doctype: str | None = None, ref_docname: str | None = None):
+	#: ``ref_docname`` is a Data column, so 140 characters is a hard limit rather than a
+	#: preference. Cancelling a paid order produces payment entries, a credit note, an invoice
+	#: and the order itself; joined, those overflowed it, and the insert failed *after* every
+	#: cancellation had been committed -- so the work was done and the log said Error.
+	MAX_REF_DOCNAME = 140
+
+	def mark_success(
+		self,
+		ref_doctype: str | None = None,
+		ref_docname: str | None = None,
+		result: str | None = None,
+	):
+		"""Record the success. ``result`` carries detail too long for ``ref_docname``."""
+		if ref_docname and len(ref_docname) > self.MAX_REF_DOCNAME:
+			# Never let bookkeeping undo real work. Truncating loses a label; raising here
+			# loses the record that anything happened at all.
+			result = result or ref_docname
+			ref_docname = ref_docname[: self.MAX_REF_DOCNAME]
+
 		self.db_set(
 			{
 				"status": "Success",
 				"processed_on": now_datetime(),
 				"ref_doctype": ref_doctype,
 				"ref_docname": ref_docname,
+				"result": result,
 				"traceback": None,
 			}
 		)

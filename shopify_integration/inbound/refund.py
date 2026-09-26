@@ -29,7 +29,7 @@ from decimal import Decimal
 
 import frappe
 from frappe import _
-from frappe.utils import cstr, flt
+from frappe.utils import cint, cstr, flt
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import inbound_write, mark
@@ -67,11 +67,21 @@ def on_refund_create(event_log: str):
 
 		result = create_credit_note(store_doc, refund)
 		frappe.db.commit()
-		log.mark_success(ref_doctype="Sales Invoice", ref_docname=result.get("credit_note"))
+		log.mark_success(
+			ref_doctype="Sales Invoice",
+			ref_docname=result.get("credit_note"),
+			result=_describe(result),
+		)
 		return result
 	except Exception:
 		log.mark_error(frappe.get_traceback())
 		raise
+
+
+def _describe(result: dict) -> str:
+	"""What the refund actually did, for the event log to keep."""
+	parts = [f"{key}: {value}" for key, value in result.items() if value]
+	return "; ".join(parts) or "nothing to do"
 
 
 def _refund_gid(payload: dict) -> str | None:
@@ -135,12 +145,88 @@ def create_credit_note(store_doc, refund: dict) -> dict:
 	credit_note = _build_return_invoice(store_doc, refund, invoice_name, quantities, side)
 	delivery_return = _restock(store_doc, refund, order_gid, quantities)
 	payment = _reverse_payment(store_doc, credit_note, refund, side)
+	closed = close_if_fully_refunded(store_doc, refund)
 
 	return {
 		"credit_note": credit_note,
 		"return_delivery_note": delivery_return,
 		"payment_entry": payment,
+		"closed_sales_order": closed,
 	}
+
+
+def close_if_fully_refunded(store_doc, refund: dict) -> str | None:
+	"""Close the Sales Order once Shopify says nothing on it is still owed.
+
+	A return Delivery Note puts ``delivered_qty`` back down, and nothing else closes the order.
+	So a delivered order that is refunded in full drops from Completed back to "To Deliver",
+	**reserves its stock again**, and reappears on the staff list where someone could ship it a
+	second time. Because availability is pushed as on-hand minus reserved, the website then
+	shows one piece fewer for every refunded order, permanently. An order refunded before it
+	ever shipped leaks the same reservation without any return note being involved.
+
+	Closing is what releases it -- ERPNext's own ``update_status`` recalculates ``reserved_qty``
+	as part of the change.
+
+	Judged on ``currentQuantity``, which Shopify states per line as what remains after *every*
+	refund against that order, so a second partial refund closes the order exactly when the last
+	unit goes and not before. A partly refunded order still owes the rest and is left open.
+	"""
+	order = refund.get("order") or {}
+	order_gid = order.get("id")
+	if not order_gid:
+		return None
+
+	lines = (order.get("lineItems") or {}).get("nodes") or []
+	if not lines:
+		# No line data to judge by -- an older payload, or a refund of shipping only. Leaving the
+		# order open is the safe half of the guess: a stuck reservation is visible and fixable,
+		# closing an order that still owes goods is not.
+		return None
+
+	if any(cint(line.get("currentQuantity")) > 0 for line in lines):
+		return None
+
+	name = frappe.db.get_value(
+		"Sales Order",
+		{"shopify_store": store_doc.name, "shopify_order_gid": order_gid, "docstatus": 1},
+		"name",
+	)
+	if not name:
+		return None
+
+	status = frappe.db.get_value("Sales Order", name, "status")
+	if status in ("Closed", "Completed"):
+		# Closed already -- a redelivered webhook, and this must do nothing the second time.
+		# Completed means the goods were kept and only the money went back, so the order is
+		# genuinely finished and holds no reservation to release.
+		return None
+
+	with inbound_write():
+		sales_order = frappe.get_doc("Sales Order", name)
+		mark(sales_order)
+		sales_order.update_status("Closed")
+
+	_push_released_stock(store_doc, name)
+	return name
+
+
+def _push_released_stock(store_doc, sales_order: str) -> None:
+	"""Tell Shopify the units are sellable again.
+
+	Closing an order is not a submit or a cancel, so the reservation hook on those events never
+	fires and the freed stock would sit unsent until the nightly reconciliation noticed.
+	"""
+	from shopify_integration.outbound.inventory import enqueue_for_item
+
+	for item_code, warehouse in frappe.get_all(
+		"Sales Order Item",
+		filters={"parent": sales_order},
+		fields=["item_code", "warehouse"],
+		as_list=True,
+	):
+		if item_code and warehouse:
+			enqueue_for_item(item_code, warehouse, "Sales Order", sales_order)
 
 
 def _side_for(invoice_name: str, company: str) -> str:

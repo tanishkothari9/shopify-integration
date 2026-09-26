@@ -111,7 +111,11 @@ def on_order_fulfilled(event_log: str):
 
 		created = create_delivery_notes(store_doc, order)
 		frappe.db.commit()
-		log.mark_success(ref_doctype="Delivery Note", ref_docname=", ".join(created) if created else None)
+		log.mark_success(
+			ref_doctype="Delivery Note",
+			ref_docname=created[0] if created else None,
+			result=", ".join(created) or "no fulfilment to record",
+		)
 		return {"delivery_notes": created}
 	except Exception:
 		log.mark_error(frappe.get_traceback())
@@ -126,7 +130,15 @@ def on_order_cancelled(event_log: str):
 		gid = (order or {}).get("id") or _order_gid(payload_of(event_log))
 		cancelled = cancel_linked_documents(log.store, gid)
 		frappe.db.commit()
-		log.mark_success(ref_doctype="Sales Order", ref_docname=", ".join(cancelled) or None)
+		# The Sales Order alone in ref_docname. A paid order cancels its payment entries, its
+		# credit note and its invoice as well, and the four names joined overflow a Data column
+		# -- which used to fail the log *after* every cancellation had been committed, marking
+		# a completed job as Error.
+		log.mark_success(
+			ref_doctype="Sales Order",
+			ref_docname=existing_sales_order(log.store, gid),
+			result=", ".join(cancelled) or "nothing linked to cancel",
+		)
 		return {"cancelled": cancelled}
 	except Exception:
 		log.mark_error(frappe.get_traceback())

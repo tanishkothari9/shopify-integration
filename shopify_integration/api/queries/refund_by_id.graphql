@@ -11,9 +11,21 @@ query refund($id: ID!) {
     id
     createdAt
     note
+    # currentQuantity is what is left on the line after every refund against this order, not
+    # just this one -- which is exactly the question "is anything still owed?". Fetched here
+    # rather than in a second call because the refund handler needs it on every refund.
     order {
       id
       name
+      displayFinancialStatus
+      lineItems(first: 250) {
+        nodes {
+          id
+          sku
+          quantity
+          currentQuantity
+        }
+      }
     }
     totalRefundedSet {
       shopMoney { amount currencyCode }
