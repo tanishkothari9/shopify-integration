@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import frappe
 from frappe import _
-from frappe.utils import cstr
+from frappe.utils import cstr, flt
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import inbound_write, mark
@@ -128,6 +128,26 @@ def on_order_cancelled(event_log: str):
 	try:
 		order = fetch_order(log.store, payload_of(event_log))
 		gid = (order or {}).get("id") or _order_gid(payload_of(event_log))
+		closed = _closed_sales_order(log.store, gid)
+		if closed:
+			if _fully_refunded(log.store, gid):
+				# The refund webhook won the race and did all of this already: it credited the
+				# invoice, reversed the payment and closed the order. The books are right, and
+				# an invoice with its credit note is the correct record of a sale that was
+				# refunded -- tearing both up would lose the history and change nothing.
+				log.mark_skipped("order already fully refunded and closed in ERPNext; nothing to cancel")
+				return {"skipped": "already fully refunded and closed", "sales_order": closed}
+
+			# Closed, but the money is still held. Nobody should guess at this one.
+			frappe.throw(
+				_(
+					"Shopify order {0} was cancelled, but Sales Order {1} is Closed in ERPNext "
+					"and its invoice has not been credited back. Someone closed it by hand while "
+					"the customer's money is still held. Re-open the Sales Order and replay this "
+					"webhook, or refund the invoice, depending on what actually happened."
+				).format(order.get("name") if order else gid, closed)
+			)
+
 		cancelled = cancel_linked_documents(log.store, gid)
 		frappe.db.commit()
 		# The Sales Order alone in ref_docname. A paid order cancels its payment entries, its
@@ -738,6 +758,36 @@ def _warehouse_for(store_doc, fulfilment: dict) -> str:
 # --------------------------------------------------------------------------------------
 # Cancellation
 # --------------------------------------------------------------------------------------
+
+
+def _closed_sales_order(store: str, order_gid: str | None) -> str | None:
+	"""This order's Sales Order, but only if it is submitted and Closed."""
+	if not order_gid:
+		return None
+
+	name = frappe.db.get_value(
+		"Sales Order",
+		{"shopify_store": store, "shopify_order_gid": order_gid, "docstatus": 1},
+		"name",
+	)
+	if not name:
+		return None
+	return name if frappe.db.get_value("Sales Order", name, "status") == "Closed" else None
+
+
+def _fully_refunded(store: str, order_gid: str | None) -> bool:
+	"""Whether everything invoiced for this order has been credited back.
+
+	Credit notes carry a negative total in ERPNext, so the invoices and their returns sum to
+	zero exactly when nothing is still owed. An order with no invoice at all is not "fully
+	refunded" -- there was never anything to refund -- and must not be swept up by this.
+	"""
+	totals = frappe.get_all(
+		"Sales Invoice",
+		filters={"shopify_store": store, "shopify_order_gid": order_gid, "docstatus": 1},
+		pluck="base_grand_total",
+	)
+	return bool(totals) and flt(sum(flt(total) for total in totals), 2) == 0
 
 
 def cancel_linked_documents(store: str, order_gid: str | None) -> list[str]:
