@@ -137,6 +137,18 @@ def create_credit_note(store_doc, refund: dict) -> dict:
 				"skipped": "order already cancelled in ERPNext; nothing to credit",
 				"order": order_gid,
 			}
+
+		if _moves_no_money(refund):
+			# Cancelling an unpaid order -- COD, say -- makes Shopify write a restocking refund
+			# for zero alongside orders/cancelled, and either can be handled first. Arriving
+			# before the cancellation, this one finds no invoice, because an unpaid order never
+			# had one. There is nothing to credit and the stock comes back when the order is
+			# cancelled a moment later, so the only thing left to get wrong is the log.
+			return {
+				"skipped": "no money refunded and no invoice; stock is handled by the order cancellation",
+				"order": order_gid,
+			}
+
 		frappe.throw(
 			_(
 				"Refund {0} is for Shopify order {1}, which has no Sales Invoice in ERPNext. "
@@ -385,14 +397,13 @@ def _build_return_invoice(store_doc, refund: dict, invoice_name: str, quantities
 	return credit_note.name
 
 
-def _refunded_nothing(refund: dict) -> bool:
-	"""True when the refund moves no money and returns no goods.
+def _moves_no_money(refund: dict) -> bool:
+	"""True when not a rupee changes hands: no refunded total, no shipping, no settled
+	transaction.
 
-	Shopify records one of these whenever an unpaid order is cancelled. It is bookkeeping, not
-	a return: nothing was charged, so nothing is being given back.
-
-	Both halves are checked. A zero total with line items is a restock worth recording; a
-	refund with neither is the cancellation artefact.
+	Deliberately separate from whether goods come back. Cancelling an unpaid order produces a
+	refund that restocks the goods while returning nothing, because nothing was ever charged,
+	and those two facts need answering independently.
 	"""
 	for key in ("totalRefundedSet", "totalRefunded"):
 		bag = refund.get(key)
@@ -402,6 +413,28 @@ def _refunded_nothing(refund: dict) -> bool:
 					return False
 
 	if (refund.get("refundShippingLines") or {}).get("nodes"):
+		return False
+
+	for node in (refund.get("transactions") or {}).get("nodes") or []:
+		if cstr(node.get("status")).upper() != "SUCCESS":
+			continue
+		for side in (SHOP_MONEY, PRESENTMENT_MONEY):
+			if money_field(node, "amountSet", side) != ZERO:
+				return False
+
+	return True
+
+
+def _refunded_nothing(refund: dict) -> bool:
+	"""True when the refund moves no money and returns no goods.
+
+	Shopify records one of these whenever an unpaid order is cancelled. It is bookkeeping, not
+	a return: nothing was charged, so nothing is being given back.
+
+	Both halves are checked. A zero total with line items is a restock worth recording; a
+	refund with neither is the cancellation artefact.
+	"""
+	if not _moves_no_money(refund):
 		return False
 
 	# Line items alone do not make it a real refund. Shopify lists the cancelled order's lines

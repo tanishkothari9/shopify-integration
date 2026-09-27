@@ -1,0 +1,9 @@
+# Just the status, to tell a product that is already live from one being switched on.
+# Publishing is worth doing on the DRAFT/ARCHIVED -> ACTIVE step and never again: a merchant
+# who unpublished a live product by hand must not have it put back on every ERPNext save.
+query productStatus($id: ID!) {
+  product(id: $id) {
+    id
+    status
+  }
+}

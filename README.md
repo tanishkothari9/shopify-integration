@@ -180,6 +180,7 @@ documents in `shopify_integration/api/queries/` as part of the upgrade.
 | `read_locations` | Mapping warehouses to Shopify locations |
 | `read_customers` | Customer, Address and Contact creation |
 | `write_merchant_managed_fulfillment_orders` | Marking orders fulfilled and pushing tracking |
+| `read_publications`, `write_publications` | Putting new products on the Online Store, so customers can see them |
 
 ## Design
 

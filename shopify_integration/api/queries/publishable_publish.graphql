@@ -1,0 +1,19 @@
+# Put a product on a sales channel. Without this a product created by the app exists in the
+# admin with onlineStoreUrl null -- correct in every field, and invisible to customers.
+#
+# Only ever used to publish, never to unpublish: once a product is on the channel, whether it
+# stays there is the merchant's decision, not something an ERPNext save should overrule.
+mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    publishable {
+      ... on Product {
+        id
+        publishedAt
+      }
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

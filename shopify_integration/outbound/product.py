@@ -200,13 +200,95 @@ def push_products(store: str, rows: list[dict]) -> None:
 			payload["title"] = cstr(item.item_name)[:255]
 			payload["descriptionHtml"] = cstr(item.description or "")
 
+		# Read Shopify's current status only for a product this app has never considered
+		# publishing -- one created before it did so. Once the decision is recorded, no later
+		# save costs an extra call, and none revisits it: a product that is ACTIVE and off the
+		# channel was taken off by the merchant, and an ERPNext save must not overrule that.
+		pending = payload["status"] == "ACTIVE" and not _publish_decided(link.name)
+		was = _shopify_status(client, link.product_gid) if pending else None
+
 		client.execute(load_query("product_update"), {"product": payload}, cost_hint=10)
+
+		if pending:
+			if was in ("DRAFT", "ARCHIVED"):
+				publish_to_online_store(client, store, link.product_gid)
+			_mark_publish_decided(store, link.product_gid)
+
 		_sync_image(client, link.product_gid, item)
 
 
 # --------------------------------------------------------------------------------------
 # Creating a Shopify product from an ERPNext item
 # --------------------------------------------------------------------------------------
+
+
+#: Shopify's own Online Store channel. Matched on the app's handle rather than its title,
+#: which is localised.
+ONLINE_STORE_APP_HANDLE = "online_store"
+
+
+def online_store_publication(client: ShopifyClient, store: str) -> str | None:
+	"""The Online Store publication's id for this shop, or None if there is not one.
+
+	Remembered for the life of the job, which is the scale that matters: one drain can create
+	fifty products, and they would otherwise ask the same unchanging question fifty times.
+	A miss is remembered too, so a shop with no Online Store is not re-queried either.
+	"""
+	memo = getattr(frappe.local, "shopify_online_store_publication", None)
+	if memo is None:
+		memo = frappe.local.shopify_online_store_publication = {}
+	if store in memo:
+		return memo[store]
+
+	found = None
+	data = client.execute(load_query("publications"), {}, cost_hint=5)
+	for node in (data.get("publications") or {}).get("nodes") or []:
+		catalog = node.get("catalog") or {}
+		apps = (catalog.get("apps") or {}).get("nodes") or []
+		handles = {cstr(app.get("handle")).lower() for app in apps}
+		titles = {cstr(app.get("title")).strip().lower() for app in apps}
+		titles.add(cstr(catalog.get("title")).strip().lower())
+		if ONLINE_STORE_APP_HANDLE in handles or "online store" in titles:
+			found = node["id"]
+			break
+
+	memo[store] = found
+	return found
+
+
+def publish_to_online_store(client: ShopifyClient, store: str, product_gid: str) -> bool:
+	"""Put a product on the Online Store, so a customer can actually see it.
+
+	Creating a product leaves it in the admin with ``onlineStoreUrl`` null: every field
+	correct, and invisible to the storefront. Publishing is the separate step nobody notices
+	is missing until they look at the shop.
+
+	Never raises. A shop that installed the app before ``read_publications`` and
+	``write_publications`` were asked for will refuse this call, and losing the product sync
+	over a channel assignment would be the worse failure -- the product is created either way,
+	and the store form already warns about missing scopes.
+	"""
+	try:
+		publication = online_store_publication(client, store)
+		if not publication:
+			frappe.logger("shopify_integration").warning(
+				f"{store} has no Online Store publication; leaving the product unpublished."
+			)
+			return False
+
+		client.execute(
+			load_query("publishable_publish"),
+			{"id": product_gid, "input": [{"publicationId": publication}]},
+			cost_hint=10,
+		)
+		return True
+	except Exception as exc:
+		frappe.logger("shopify_integration").warning(
+			f"Could not publish {product_gid} to the Online Store for {store}: {exc}. "
+			"The product exists but customers cannot see it. If the app was installed before "
+			"it asked for read_publications and write_publications, reinstall it."
+		)
+		return False
 
 
 def _should_publish(store: str, item_code: str) -> bool:
@@ -276,6 +358,10 @@ def _create_product(client: ShopifyClient, store: str, item_code: str) -> str | 
 	# Re-read: SKUs, prices and inventory items only exist after the second call, and a link
 	# without the inventory item id cannot push stock.
 	product = _reread(client, product["id"]) or product
+
+	if cstr(payload.get("status")) == "ACTIVE":
+		publish_to_online_store(client, store, product["id"])
+	_publish_pending[product["id"]] = cstr(payload.get("status")) == "ACTIVE"
 
 	if children:
 		_link_variants(store, item_code, product, children)
@@ -391,12 +477,68 @@ def _reread(client: ShopifyClient, product_gid: str) -> dict | None:
 	return product
 
 
+#: Products published during this job, so the links created a moment later can record it.
+_publish_pending: dict[str, bool] = {}
+
+
+def _publish_decided(link_name: str) -> bool:
+	return bool(frappe.db.get_value("Shopify Item Link", link_name, "online_store_publish_done"))
+
+
+def _mark_publish_decided(store: str, product_gid: str) -> None:
+	"""Record that this product's one publish decision has been made.
+
+	Per product rather than per link: a variant product has one Shopify product and many
+	links, and the channel is a property of the product.
+	"""
+	for name in frappe.get_all(
+		"Shopify Item Link", filters={"store": store, "product_gid": product_gid}, pluck="name"
+	):
+		frappe.db.set_value("Shopify Item Link", name, "online_store_publish_done", 1, update_modified=False)
+
+
+def _shopify_status(client: ShopifyClient, product_gid: str) -> str | None:
+	"""Shopify's current status for a product, or None if it cannot be read."""
+	try:
+		data = client.execute(load_query("product_status"), {"id": product_gid}, cost_hint=2)
+		return cstr((data.get("product") or {}).get("status")) or None
+	except Exception:
+		return None
+
+
+def push_initial_stock(store: str, item_code: str) -> int:
+	"""Send what ERPNext already has of a newly linked item.
+
+	Inventory is otherwise pushed only when stock *moves*. A product published with three on
+	the shelf therefore went live showing zero, and stayed at zero until someone sold or
+	received one, or the 03:00 reconciliation came round -- an item listed as out of stock on
+	the day it appears being close to the worst version of that.
+
+	Every mapped warehouse, because the store may sell one item from several, and the normal
+	enqueue so it batches and dedupes with everything else.
+	"""
+	from shopify_integration.outbound.inventory import enqueue_for_item
+
+	store_doc = frappe.get_cached_doc("Shopify Store", store)
+	if not store_doc.sync_inventory:
+		return 0
+
+	queued = 0
+	for row in store_doc.location_map or []:
+		if row.warehouse:
+			queued += enqueue_for_item(item_code, row.warehouse, "Item", item_code)
+	return queued
+
+
 def _link(store: str, item_code: str, product: dict) -> None:
 	from shopify_integration.catalogue.mapping import upsert_link
 
 	variants = product.get("variants") or []
 	variant = variants[0] if variants else {}
 	upsert_link(store, item_code=item_code, product=product, variant=variant, is_variant=False)
+	if _publish_pending.pop(cstr(product.get("id")), False):
+		_mark_publish_decided(store, cstr(product.get("id")))
+	push_initial_stock(store, item_code)
 
 
 # --------------------------------------------------------------------------------------
@@ -523,6 +665,10 @@ def _link_variants(store: str, template: str, product: dict, children: list[dict
 			is_variant=True,
 			template_item=template,
 		)
+		push_initial_stock(store, child["item_code"])
+
+	if _publish_pending.pop(cstr(product.get("id")), False):
+		_mark_publish_decided(store, cstr(product.get("id")))
 
 
 def _attach_to_published_template(client: ShopifyClient, store: str, item_code: str) -> bool:

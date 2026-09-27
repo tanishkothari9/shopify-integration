@@ -1,0 +1,23 @@
+# The shop's app publications, to find the Online Store among them.
+#
+# Publication itself carries no name in this API version, so the Online Store is identified
+# through its catalog's app. The app's `handle` is matched rather than its title because the
+# title is localised and a shop in another language would never match "Online Store".
+query publications {
+  publications(first: 25, catalogType: APP) {
+    nodes {
+      id
+      catalog {
+        ... on AppCatalog {
+          title
+          apps(first: 1) {
+            nodes {
+              handle
+              title
+            }
+          }
+        }
+      }
+    }
+  }
+}

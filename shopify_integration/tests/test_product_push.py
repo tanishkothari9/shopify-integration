@@ -51,12 +51,25 @@ class ProductPushTestCase(FrappeTestCase):
 		frappe.db.commit()
 
 	def _push(self) -> dict:
-		"""Run one product row and return the `product` payload that reached Shopify."""
-		client = FakeClient({"productUpdate": {"productUpdate": {"product": {"id": PRODUCT_GID}}}})
+		"""Run one product row and return the `product` payload that reached Shopify.
+
+		The update call is picked out by name rather than assumed to be the only one: a first
+		push also puts the product on the Online Store, and this is about what the *update*
+		sends, not how many calls surround it.
+		"""
+		client = FakeClient(
+			{
+				"productUpdate": {"productUpdate": {"product": {"id": PRODUCT_GID}}},
+				"publications": {"publications": {"nodes": []}},
+				"publishablePublish": {"publishablePublish": {"userErrors": []}},
+			}
+		)
 		with patch.object(product_module.ShopifyClient, "for_store", return_value=client):
 			product_module.push_products(self.store, [{"ref_docname": self.item_code}])
-		self.assertEqual(len(client.calls), 1)
-		return client.calls[0]["variables"]["product"]
+
+		updates = [c for c in client.calls if "productUpdate" in c["query"]]
+		self.assertEqual(len(updates), 1, "exactly one product update per push")
+		return updates[0]["variables"]["product"]
 
 	def _set_titles(self, on: int):
 		frappe.db.set_value("Shopify Store", self.store, "sync_item_titles", on)

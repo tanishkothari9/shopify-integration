@@ -452,3 +452,107 @@ class TestTheLogCanSaySkipped(FrappeTestCase):
 		saved = frappe.db.get_value("Shopify Event Log", doc.name, ["status", "result"], as_dict=True)
 		self.assertEqual(saved.status, "Skipped")
 		self.assertIn("already cancelled", saved.result)
+
+
+class TestCancellingAnUnpaidOrderWithRestock(FrappeTestCase):
+	"""An unpaid order cancelled with restock makes Shopify write a zero-money refund.
+
+	orders/cancelled and refunds/create arrive together and either can win. Arriving first,
+	the refund finds no invoice -- because an unpaid order never had one -- and used to raise.
+	The stock comes back when the cancellation is handled a moment later, so there is nothing
+	to credit and nothing to fix except the log.
+	"""
+
+	def _refund(self, amount="0.00", restock="CANCEL", transactions=None):
+		return {
+			"id": "gid://shopify/Refund/1118",
+			"createdAt": "2026-09-26T20:22:49Z",
+			"order": {"id": "gid://shopify/Order/1118", "name": "#1118"},
+			"totalRefundedSet": {
+				"shopMoney": {"amount": amount},
+				"presentmentMoney": {"amount": amount},
+			},
+			"refundLineItems": {
+				"nodes": [
+					{
+						"quantity": 1,
+						"restockType": restock,
+						"lineItem": {"id": "gid://shopify/LineItem/1", "sku": "ORD-TEE"},
+					}
+				]
+			},
+			"transactions": {"nodes": transactions or []},
+		}
+
+	def test_a_restocking_refund_for_zero_moves_no_money(self):
+		from shopify_integration.inbound.refund import _moves_no_money
+
+		self.assertTrue(_moves_no_money(self._refund()))
+
+	def test_a_refund_that_returns_money_does_not_qualify(self):
+		from shopify_integration.inbound.refund import _moves_no_money
+
+		self.assertFalse(_moves_no_money(self._refund(amount="499.00")))
+
+	def test_a_settled_refund_transaction_counts_as_money(self):
+		"""Zero on the header but a successful refund transaction is still real money."""
+		from shopify_integration.inbound.refund import _moves_no_money
+
+		refund = self._refund(
+			transactions=[
+				{
+					"kind": "REFUND",
+					"status": "SUCCESS",
+					"amountSet": {
+						"shopMoney": {"amount": "250.00"},
+						"presentmentMoney": {"amount": "250.00"},
+					},
+				}
+			]
+		)
+		self.assertFalse(_moves_no_money(refund))
+
+	def test_a_failed_transaction_does_not_count(self):
+		from shopify_integration.inbound.refund import _moves_no_money
+
+		refund = self._refund(
+			transactions=[
+				{
+					"kind": "REFUND",
+					"status": "FAILURE",
+					"amountSet": {
+						"shopMoney": {"amount": "250.00"},
+						"presentmentMoney": {"amount": "250.00"},
+					},
+				}
+			]
+		)
+		self.assertTrue(_moves_no_money(refund))
+
+	def test_refunded_shipping_counts_as_money(self):
+		from shopify_integration.inbound.refund import _moves_no_money
+
+		refund = self._refund()
+		refund["refundShippingLines"] = {"nodes": [{"shippingLine": {"title": "Standard"}}]}
+		self.assertFalse(_moves_no_money(refund))
+
+	def test_the_restocking_refund_is_skipped_rather_than_failed(self):
+		"""The regression: #1118 logged 'has no Sales Invoice in ERPNext'."""
+		from shopify_integration.inbound.refund import create_credit_note
+
+		store = frappe.get_cached_doc(
+			"Shopify Store", frappe.get_all("Shopify Store", limit=1, pluck="name")[0]
+		)
+		result = create_credit_note(store, self._refund())
+		self.assertIn("no money refunded", result.get("skipped", ""))
+
+	def test_a_real_refund_with_no_invoice_still_raises(self):
+		"""Money went back and there is nothing to credit it against. That is a real gap."""
+		from shopify_integration.inbound.refund import create_credit_note
+
+		store = frappe.get_cached_doc(
+			"Shopify Store", frappe.get_all("Shopify Store", limit=1, pluck="name")[0]
+		)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			create_credit_note(store, self._refund(amount="499.00"))
+		self.assertIn("no Sales Invoice", str(caught.exception))

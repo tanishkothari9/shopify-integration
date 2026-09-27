@@ -26,7 +26,7 @@ Indian GST, and you cannot fix it later without starting again.
 
 **Settings → Apps and sales channels → Develop apps → Create an app**
 
-Under **Configuration → Admin API integration**, tick these eight:
+Under **Configuration → Admin API integration**, tick these ten:
 
 ```
 read_products      write_products
@@ -35,10 +35,13 @@ read_inventory     write_inventory
 read_locations
 read_customers
 write_merchant_managed_fulfillment_orders
+read_publications  write_publications
 ```
 
-That last one is only needed if you want ERPNext to mark orders shipped. Ask for it now
-anyway — adding it later means re-authorising the whole app.
+`write_merchant_managed_fulfillment_orders` is only needed if you want ERPNext to mark orders
+shipped, and the publication pair only if you want products it creates to appear on your
+website rather than sitting unpublished in the admin. Ask for all of them now anyway — adding
+one later means re-authorising the whole app.
 
 Then **Install app**, and copy:
 

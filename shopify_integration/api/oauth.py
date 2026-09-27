@@ -48,6 +48,11 @@ REQUIRED_SCOPES = (
 	# even though fulfilment is off by default: the alternative is a merchant who ticks
 	# "Sync Fulfilments" months later and has to re-authorise the whole app to use it.
 	"write_merchant_managed_fulfillment_orders",
+	# Without these a product the app creates sits in the admin with no storefront URL:
+	# every field correct, and invisible to customers. Publishing to the Online Store is a
+	# separate step from creating the product, and it needs its own permission.
+	"read_publications",
+	"write_publications",
 )
 
 #: A shop domain must look exactly like this. The value arrives in a query parameter on a
