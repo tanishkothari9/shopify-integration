@@ -318,25 +318,41 @@ def _create_product(client: ShopifyClient, store: str, item_code: str) -> str | 
 		)
 		return None
 
-	options = _options_from(children) if children else []
-
 	# A product with no price anywhere must not go live. Shopify starts a new variant at 0.00,
 	# so publishing it ACTIVE puts a free saree in the shop -- worse than not publishing at
 	# all, and nothing in Shopify flags it. Draft keeps the mapping, the SKU and the inventory
 	# link, and leaves the merchant to price it and hit Activate.
-	price = _selling_price(item_code, store_doc)
-	if price is None:
+	#
+	# For a template the price is on the *variants*, not on the template, which normally has
+	# none. Judging the template by its own price made almost the entire catalogue go live as
+	# DRAFT -- correctly priced variants and all -- and DRAFT products are never published to
+	# the Online Store, so they were invisible twice over.
+	children, unpriced, any_variant_priced = _sellable_variants(children, store_doc)
+	has_price = (
+		any_variant_priced if item.get("has_variants") else (_selling_price(item_code, store_doc) is not None)
+	)
+
+	if unpriced:
+		frappe.logger("shopify_integration").warning(
+			f"{item_code}: leaving {len(unpriced)} variant(s) off {store} until they are priced "
+			f"-- {', '.join(unpriced)}. Shopify would otherwise sell them at 0.00. Price them "
+			"and save the Item to add them."
+		)
+	if not has_price:
 		frappe.logger("shopify_integration").info(
 			f"Publishing {item_code} to {store} as DRAFT: no selling price on "
-			f"'{store_doc.selling_price_list}' and no standard rate on the Item."
+			f"'{store_doc.selling_price_list}' and no standard rate"
+			+ (" on any variant." if item.get("has_variants") else " on the Item.")
 		)
+
+	options = _options_from(children) if children else []
 
 	payload = {
 		"title": cstr(item.item_name or item_code)[:255],
 		"descriptionHtml": cstr(item.description or ""),
 		"productType": cstr(item.item_group or "")[:255],
 		"vendor": cstr(item.get("brand") or "")[:255] or None,
-		"status": "ARCHIVED" if item.disabled else ("ACTIVE" if price is not None else "DRAFT"),
+		"status": "ARCHIVED" if item.disabled else ("ACTIVE" if has_price else "DRAFT"),
 	}
 	if options:
 		payload["productOptions"] = options
@@ -454,6 +470,30 @@ def _sync_image(client: ShopifyClient, product_gid: str, item) -> None:
 	errors = (result.get("productCreateMedia") or {}).get("mediaUserErrors") or []
 	if errors:
 		frappe.logger("shopify_integration").warning(f"Shopify refused {item.name}'s image ({url}): {errors}")
+
+
+def _sellable_variants(children: list[dict], store_doc) -> tuple[list[dict], list[str], bool]:
+	"""Split a template's variants into the ones that can be sold and the ones that cannot.
+
+	Returns the variants to create, the item codes held back, and whether any price was found
+	at all -- which is what decides ACTIVE or DRAFT for the template.
+
+	A variant with no price would be listed at 0.00, which is worse than not being listed. So
+	priced variants go up and the rest are held back by name, for somebody to price.
+
+	The exception is a template where *nothing* is priced. Those go up whole, as DRAFT: the
+	product sells nothing either way, and keeping every variant means the SKUs, the mapping
+	and the inventory links all exist ready for the day it is priced.
+	"""
+	if not children:
+		return [], [], False
+
+	priced = [child for child in children if _selling_price(child["item_code"], store_doc) is not None]
+	if not priced:
+		return children, [], False
+
+	unpriced = [child["item_code"] for child in children if child not in priced]
+	return priced, unpriced, True
 
 
 def _selling_price(item_code: str, store_doc):
