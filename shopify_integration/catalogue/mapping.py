@@ -90,9 +90,12 @@ def _write_variant_product(store: str, product: dict, options: list[dict], varia
 	template = _upsert_template(template_code, product, attributes, item_group_for(product), store)
 
 	links = []
+	warnings = []
 	for variant in variants:
 		variant_code = resolve_item_code(store, product, variant)
-		item = _upsert_variant_item(variant_code, template, product, variant, store)
+		item, warning = _upsert_variant_item(variant_code, template, product, variant, store)
+		if warning:
+			warnings.append(warning)
 		links.append(
 			upsert_link(
 				store,
@@ -103,7 +106,10 @@ def _write_variant_product(store: str, product: dict, options: list[dict], varia
 				template_item=template.name,
 			)
 		)
-	return {"item": template.name, "links": links, "template": template.name}
+	result = {"item": template.name, "links": links, "template": template.name}
+	if warnings:
+		result["warnings"] = warnings
+	return result
 
 
 # --------------------------------------------------------------------------------------
@@ -195,18 +201,86 @@ def _upsert_variant_item(item_code: str, template, product: dict, variant: dict,
 	item.disabled = 1 if product.get("status") == "ARCHIVED" else 0
 	_apply_weight(item, variant)
 
-	item.set("attributes", [])
-	for selected in variant.get("selectedOptions") or []:
-		attribute = cstr(selected.get("name")).strip()
-		value = cstr(selected.get("value")).strip()
-		if not attribute or not value:
-			continue
-		ensure_attribute_value(attribute, value)
-		item.append("attributes", {"attribute": attribute, "attribute_value": value})
+	warning = _apply_variant_attributes(item, variant, existing)
 
 	mark(item)
 	item.save(ignore_permissions=True)
-	return item
+	return item, warning
+
+
+def _attribute_pairs(variant: dict) -> list[tuple[str, str]]:
+	"""The (attribute, value) pairs Shopify states for this variant, cleaned."""
+	pairs = []
+	for selected in variant.get("selectedOptions") or []:
+		attribute = cstr(selected.get("name")).strip()
+		value = cstr(selected.get("value")).strip()
+		if attribute and value:
+			pairs.append((attribute, value))
+	return pairs
+
+
+def _same_attributes(item, wanted: list[tuple[str, str]]) -> bool:
+	"""Whether the item already carries exactly these attributes.
+
+	Compared case- and space-insensitively on both sides, because "Golden" and "golden " are
+	the same option to a merchant and rewriting the row for that difference is what ERPNext
+	refuses.
+	"""
+
+	def normalise(pairs):
+		return sorted((a.strip().casefold(), v.strip().casefold()) for a, v in pairs)
+
+	current = [(row.attribute, row.attribute_value) for row in item.get("attributes") or []]
+	return normalise(current) == normalise(wanted)
+
+
+def _has_stock_history(item_code: str) -> bool:
+	return bool(frappe.db.exists("Stock Ledger Entry", {"item_code": item_code, "is_cancelled": 0}))
+
+
+def _apply_variant_attributes(item, variant: dict, existing) -> str | None:
+	"""Set the variant's attributes, unless ERPNext would refuse the change.
+
+	``item.set("attributes", [])`` followed by re-appending the same rows counts as a change,
+	and ERPNext rejects any change to a variant's attributes once the item has stock
+	transactions: "Cannot change Attributes after stock transaction." Since Shopify fires
+	products/update on inventory movements among much else, that turned every update of a
+	stocked variant into a failure -- and took the rest of the update, the name, description,
+	archived flag and weight, down with it.
+
+	So: rewrite the rows only when they would actually differ, and when they differ on an item
+	that already has stock, keep the other fields and report what could not be applied rather
+	than losing the whole update.
+
+	Returns a warning to record, or None.
+	"""
+	wanted = _attribute_pairs(variant)
+
+	if existing and not wanted:
+		# Shopify saying nothing about the options is not Shopify saying there are none. A
+		# partial payload would otherwise wipe the rows off an existing variant.
+		return None
+
+	if existing and _same_attributes(item, wanted):
+		return None
+
+	if existing and wanted and _has_stock_history(item.name):
+		current = ", ".join(f"{row.attribute}={row.attribute_value}" for row in item.get("attributes") or [])
+		incoming = ", ".join(f"{attribute}={value}" for attribute, value in wanted)
+		warning = (
+			f"Variant options changed in Shopify ({current or 'none'} -> {incoming}), but {item.name} "
+			"has stock transactions and ERPNext does not allow a variant's attributes to change "
+			"after that. Everything else on the item was updated. To follow Shopify, make a new "
+			"Item and transfer the stock to it."
+		)
+		frappe.logger("shopify_integration").warning(warning)
+		return warning
+
+	item.set("attributes", [])
+	for attribute, value in wanted:
+		ensure_attribute_value(attribute, value)
+		item.append("attributes", {"attribute": attribute, "attribute_value": value})
+	return None
 
 
 def _item_name(product: dict, variant: dict) -> str:

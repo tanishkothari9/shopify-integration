@@ -127,11 +127,21 @@ def on_stock_movement(doc, method=None):
 
 
 def on_reservation_change(doc, method=None):
-	"""Sales Order on_submit / on_cancel: reserved_qty moved.
+	"""A Sales Order's reserved_qty may have moved.
 
 	The SLE hook alone would miss this entirely. Between a web order and its delivery note
 	nothing physical has moved, yet the sellable quantity has dropped.
+
+	Reached from submit and cancel, and also from ``on_change`` and ``on_update_after_submit``
+	so that Close, Re-open and Update Items are not silently missed -- see hooks.py for why
+	those two events are both needed. Being called more often than strictly necessary is the
+	cheap direction: the queue dedupes on item and location, so a burst becomes one push, and
+	an item Shopify has never heard of costs one indexed read.
 	"""
+	if doc.docstatus == 0:
+		# A draft reserves nothing, and `on_change` fires on every field written to one.
+		return
+
 	for item in doc.get("items") or []:
 		warehouse = item.get("warehouse") or doc.get("set_warehouse")
 		if warehouse:

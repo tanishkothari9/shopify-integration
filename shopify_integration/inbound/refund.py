@@ -67,11 +67,14 @@ def on_refund_create(event_log: str):
 
 		result = create_credit_note(store_doc, refund)
 		frappe.db.commit()
-		log.mark_success(
-			ref_doctype="Sales Invoice",
-			ref_docname=result.get("credit_note"),
-			result=_describe(result),
-		)
+		if result.get("skipped"):
+			log.mark_skipped(result["skipped"])
+		else:
+			log.mark_success(
+				ref_doctype="Sales Invoice",
+				ref_docname=result.get("credit_note"),
+				result=_describe(result),
+			)
 		return result
 	except Exception:
 		log.mark_error(frappe.get_traceback())
@@ -129,6 +132,11 @@ def create_credit_note(store_doc, refund: dict) -> dict:
 
 	invoice_name = _original_invoice(store_doc.name, order_gid)
 	if not invoice_name:
+		if _order_already_cancelled(store_doc.name, order_gid):
+			return {
+				"skipped": "order already cancelled in ERPNext; nothing to credit",
+				"order": order_gid,
+			}
 		frappe.throw(
 			_(
 				"Refund {0} is for Shopify order {1}, which has no Sales Invoice in ERPNext. "
@@ -227,6 +235,31 @@ def _push_released_stock(store_doc, sales_order: str) -> None:
 	):
 		if item_code and warehouse:
 			enqueue_for_item(item_code, warehouse, "Sales Order", sales_order)
+
+
+def _order_already_cancelled(store: str, order_gid: str | None) -> bool:
+	"""Whether this order's documents were cancelled before the refund was handled.
+
+	Shopify sends orders/cancelled and refunds/create at the same moment when a paid order is
+	cancelled with a refund, and either can win. If the cancellation lands first it cancels the
+	invoice, and the refund then finds nothing to credit -- correctly, because the cancellation
+	already undid everything the credit note would have. Raising there marked a healthy final
+	state as an error, on every such cancellation.
+
+	Only true when documents exist and are cancelled. An order that was never invoiced at all
+	-- invoice sync off, say -- still raises, because that is a real gap worth reporting.
+	"""
+	if not order_gid:
+		return False
+
+	link = {"shopify_store": store, "shopify_order_gid": order_gid}
+
+	invoices = frappe.get_all("Sales Invoice", filters=link, fields=["docstatus"], pluck="docstatus")
+	if invoices:
+		return all(docstatus == 2 for docstatus in invoices)
+
+	orders = frappe.get_all("Sales Order", filters=link, fields=["docstatus"], pluck="docstatus")
+	return bool(orders) and all(docstatus == 2 for docstatus in orders)
 
 
 def _side_for(invoice_name: str, company: str) -> str:

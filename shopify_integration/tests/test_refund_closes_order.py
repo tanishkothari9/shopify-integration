@@ -278,3 +278,177 @@ class TestClosingARealSalesOrder(OrderTestCase):
 
 		self.assertIsNone(close_if_fully_refunded(self.store_doc, refund_payload(gid, [("ORD-TEE", 1, 0)])))
 		self.assertNotEqual(frappe.db.get_value("Sales Order", name, "status"), "Closed")
+
+
+class TestARefundOfAnAlreadyCancelledOrder(OrderTestCase):
+	"""Shopify sends orders/cancelled and refunds/create at the same moment.
+
+	If the cancellation is handled first it cancels the invoice, and the refund then finds
+	nothing to credit -- correctly, because the cancellation already undid everything the
+	credit note would have. Raising there marked a healthy final state as an error, on every
+	cancellation of a paid order.
+	"""
+
+	def setUp(self):
+		self.made = []
+
+	def tearDown(self):
+		for doctype, name in reversed(self.made):
+			try:
+				doc = frappe.get_doc(doctype, name)
+				if doc.docstatus == 1:
+					doc.cancel()
+			except Exception:
+				pass
+			frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, ignore_missing=True)
+		frappe.db.commit()
+
+	def _cancelled_sales_order(self, order_gid):
+		doc = frappe.new_doc("Sales Order")
+		doc.customer = self.customer
+		company = frappe.db.get_value("Shopify Store", self.store, "company")
+		doc.company = company
+		doc.currency = frappe.get_cached_value("Company", company, "default_currency")
+		doc.conversion_rate = 1
+		doc.transaction_date = frappe.utils.nowdate()
+		doc.delivery_date = frappe.utils.add_days(frappe.utils.nowdate(), 3)
+		doc.shopify_store = self.store
+		doc.shopify_order_gid = order_gid
+		doc.append(
+			"items",
+			{
+				"item_code": "ORD-TEE",
+				"qty": 1,
+				"rate": 50,
+				"warehouse": self.warehouse,
+				"delivery_date": doc.delivery_date,
+			},
+		)
+		doc.insert(ignore_permissions=True)
+		doc.submit()
+		self.made.append(("Sales Order", doc.name))
+		doc.cancel()
+		frappe.db.commit()
+		return doc.name
+
+	def test_the_order_is_recognised_as_already_cancelled(self):
+		from shopify_integration.inbound.refund import _order_already_cancelled
+
+		gid = "gid://shopify/Order/9201"
+		self._cancelled_sales_order(gid)
+		self.assertTrue(_order_already_cancelled(self.store, gid))
+
+	def test_a_live_order_is_not_mistaken_for_a_cancelled_one(self):
+		from shopify_integration.inbound.refund import _order_already_cancelled
+
+		gid = "gid://shopify/Order/9202"
+		doc = frappe.new_doc("Sales Order")
+		doc.customer = self.customer
+		company = frappe.db.get_value("Shopify Store", self.store, "company")
+		doc.company = company
+		doc.currency = frappe.get_cached_value("Company", company, "default_currency")
+		doc.conversion_rate = 1
+		doc.transaction_date = frappe.utils.nowdate()
+		doc.delivery_date = frappe.utils.add_days(frappe.utils.nowdate(), 3)
+		doc.shopify_store = self.store
+		doc.shopify_order_gid = gid
+		doc.append(
+			"items",
+			{
+				"item_code": "ORD-TEE",
+				"qty": 1,
+				"rate": 50,
+				"warehouse": self.warehouse,
+				"delivery_date": doc.delivery_date,
+			},
+		)
+		doc.insert(ignore_permissions=True)
+		doc.submit()
+		self.made.append(("Sales Order", doc.name))
+		frappe.db.commit()
+
+		self.assertFalse(_order_already_cancelled(self.store, gid))
+
+	def test_an_order_this_site_never_had_is_not_called_cancelled(self):
+		"""The real gap -- invoice sync off, say -- must still raise, not be quietly skipped."""
+		from shopify_integration.inbound.refund import _order_already_cancelled
+
+		self.assertFalse(_order_already_cancelled(self.store, "gid://shopify/Order/never-seen"))
+		self.assertFalse(_order_already_cancelled(self.store, None))
+
+	def test_the_refund_is_skipped_rather_than_failed(self):
+		from shopify_integration.inbound.refund import create_credit_note
+
+		gid = "gid://shopify/Order/9203"
+		self._cancelled_sales_order(gid)
+		before = frappe.db.count("Sales Invoice")
+
+		result = create_credit_note(
+			frappe.get_cached_doc("Shopify Store", self.store),
+			{
+				"id": "gid://shopify/Refund/9203",
+				"createdAt": "2026-09-26T20:22:49Z",
+				"order": {"id": gid, "name": "#1090"},
+				"totalRefundedSet": {
+					"shopMoney": {"amount": "50.00"},
+					"presentmentMoney": {"amount": "50.00"},
+				},
+				"refundLineItems": {
+					"nodes": [
+						{
+							"quantity": 1,
+							"restockType": "RETURN",
+							"lineItem": {"id": "gid://shopify/LineItem/1", "sku": "ORD-TEE"},
+						}
+					]
+				},
+			},
+		)
+
+		self.assertIn("already cancelled", result.get("skipped", ""))
+		self.assertEqual(frappe.db.count("Sales Invoice"), before, "nothing should be written")
+
+	def test_a_refund_for_an_order_that_was_never_invoiced_still_raises(self):
+		"""Invoice sync off is a real gap and must keep reporting itself."""
+		from shopify_integration.inbound.refund import create_credit_note
+
+		with self.assertRaises(frappe.ValidationError) as caught:
+			create_credit_note(
+				frappe.get_cached_doc("Shopify Store", self.store),
+				{
+					"id": "gid://shopify/Refund/9204",
+					"createdAt": "2026-09-26T20:22:49Z",
+					"order": {"id": "gid://shopify/Order/never-invoiced", "name": "#9204"},
+					"totalRefundedSet": {
+						"shopMoney": {"amount": "50.00"},
+						"presentmentMoney": {"amount": "50.00"},
+					},
+					"refundLineItems": {
+						"nodes": [
+							{
+								"quantity": 1,
+								"restockType": "RETURN",
+								"lineItem": {"id": "gid://shopify/LineItem/1", "sku": "ORD-TEE"},
+							}
+						]
+					},
+				},
+			)
+		self.assertIn("no Sales Invoice", str(caught.exception))
+
+
+class TestTheLogCanSaySkipped(FrappeTestCase):
+	def test_mark_skipped_records_the_reason(self):
+		doc = frappe.new_doc("Shopify Event Log")
+		doc.store = frappe.get_all("Shopify Store", limit=1, pluck="name")[0]
+		doc.topic = "refunds/create"
+		doc.webhook_id = frappe.generate_hash(length=20)
+		doc.payload = "{}"
+		doc.status = "Queued"
+		doc.insert(ignore_permissions=True)
+		self.addCleanup(frappe.delete_doc, "Shopify Event Log", doc.name, force=True, ignore_permissions=True)
+
+		doc.mark_skipped("order already cancelled in ERPNext; nothing to credit")
+		saved = frappe.db.get_value("Shopify Event Log", doc.name, ["status", "result"], as_dict=True)
+		self.assertEqual(saved.status, "Skipped")
+		self.assertIn("already cancelled", saved.result)

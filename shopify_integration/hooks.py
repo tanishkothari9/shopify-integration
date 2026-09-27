@@ -68,6 +68,18 @@ doc_events: dict = {
 	"Sales Order": {
 		"on_submit": "shopify_integration.outbound.inventory.on_reservation_change",
 		"on_cancel": "shopify_integration.outbound.inventory.on_reservation_change",
+		# Submit and cancel are not the only ways reserved_qty moves. Closing or re-opening an
+		# order frees or re-takes its units, and Update Items changes them on an order already
+		# submitted -- neither is a submit or a cancel, so both used to leave Shopify short (or
+		# long) until the 03:00 reconciliation noticed.
+		#
+		# Two events because they are reached differently: Close and Re-open go through
+		# `update_status`, which writes with `db_set` and so runs `on_change` but never
+		# `on_update_after_submit`; Update Items calls `parent.save()` on a submitted document,
+		# which runs `on_update_after_submit` but not `on_change`. Both land in the same
+		# handler, and the queue's dedupe key collapses whatever overlaps.
+		"on_change": "shopify_integration.outbound.inventory.on_reservation_change",
+		"on_update_after_submit": "shopify_integration.outbound.inventory.on_reservation_change",
 	},
 	# What shipped. Marks the Shopify order fulfilled, which is what sends the customer their
 	# dispatch email -- so it is behind a store setting that starts off.

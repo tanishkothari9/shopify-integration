@@ -70,6 +70,22 @@ class ShopifyEventLog(Document):
 			}
 		)
 
+	def mark_skipped(self, reason: str):
+		"""Nothing to do, and that is the right answer.
+
+		Distinct from Success, which implies documents were written, and from Error, which
+		asks an operator to look. A skipped event is one whose work another event already did
+		or which never applied -- noise on the dashboard if it were flagged either way.
+		"""
+		self.db_set(
+			{
+				"status": "Skipped",
+				"processed_on": now_datetime(),
+				"result": reason,
+				"traceback": None,
+			}
+		)
+
 	def mark_error(self, traceback: str):
 		"""Record a failure so it survives the rollback that follows.
 

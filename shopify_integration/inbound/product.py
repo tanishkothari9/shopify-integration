@@ -95,7 +95,14 @@ def _upsert_from_webhook(event_log: str):
 			result = write_product_mapping(log.store, product)
 		frappe.db.commit()
 
-		log.mark_success(ref_doctype="Item", ref_docname=result["item"])
+		# A warning here means the item was updated but one part of it could not be: a variant
+		# whose Shopify options changed after it had stock. Recording it on the log is what
+		# makes that visible without failing an update that otherwise applied.
+		log.mark_success(
+			ref_doctype="Item",
+			ref_docname=result["item"],
+			result="; ".join(result["warnings"]) if result.get("warnings") else None,
+		)
 		return result
 	except Exception:
 		log.mark_error(frappe.get_traceback())
