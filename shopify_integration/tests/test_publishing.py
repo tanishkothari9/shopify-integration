@@ -132,24 +132,26 @@ class TestTheDecisionIsMadeOnce(FrappeTestCase):
 	extra Shopify call just to ask a question already answered.
 	"""
 
-	def test_an_undecided_link_is_reported_as_such(self):
+	def test_an_undecided_product_is_reported_as_such(self):
 		from shopify_integration.outbound.product import _publish_decided
 
-		link = self._link()
-		self.assertFalse(_publish_decided(link))
+		self._link()
+		self.assertFalse(_publish_decided(self.store, "gid://shopify/Product/ZZPUB"))
 
 	def test_marking_it_covers_every_link_on_the_product(self):
 		"""A variant product is one Shopify product and many links; the channel belongs to the
 		product, so one decision covers all of them."""
 		from shopify_integration.outbound.product import _mark_publish_decided, _publish_decided
 
-		first = self._link(item_code="ZZ-PUB-A", variant="gid://shopify/ProductVariant/A")
-		second = self._link(item_code="ZZ-PUB-B", variant="gid://shopify/ProductVariant/B")
+		self._link(item_code="ZZ-PUB-A", variant="gid://shopify/ProductVariant/A")
+		self._link(item_code="ZZ-PUB-B", variant="gid://shopify/ProductVariant/B")
 
+		self.assertFalse(_publish_decided(self.store, "gid://shopify/Product/ZZPUB"))
 		_mark_publish_decided(self.store, "gid://shopify/Product/ZZPUB")
-
-		self.assertTrue(_publish_decided(first))
-		self.assertTrue(_publish_decided(second))
+		self.assertTrue(
+			_publish_decided(self.store, "gid://shopify/Product/ZZPUB"),
+			"the decision belongs to the product, which is what a template has",
+		)
 
 	def _link(self, item_code="ZZ-PUB-A", variant="gid://shopify/ProductVariant/A"):
 		if not hasattr(self, "store"):
@@ -336,7 +338,7 @@ class TestTheWiring(FrappeTestCase):
 
 		from shopify_integration.outbound import product as product_module
 
-		source = inspect.getsource(product_module._create_product)
+		source = inspect.getsource(product_module._create_product_unlocked)
 		self.assertIn(
 			"publish_to_online_store",
 			source,

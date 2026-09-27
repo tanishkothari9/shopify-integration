@@ -354,13 +354,46 @@ def _template_already_linked(store: str, product: dict) -> str | None:
 	the range looked published and silently stopped accepting variants.
 	"""
 	gid = cstr(product.get("id"))
-	if not gid:
+	if gid:
+		by_gid = frappe.db.get_value(
+			"Shopify Item Link",
+			{"store": store, "product_gid": gid, "template_item": ("is", "set")},
+			"template_item",
+		)
+		if by_gid:
+			return by_gid
+
+	# The links may not name this product at all. A product the app created a moment ago is
+	# announced back by products/create before anything is linked to it, and a duplicate
+	# created by mistake never gets links of its own. Either way its SKUs are item codes this
+	# store already sells, and that is enough to know the range is ours: reuse the template
+	# they belong to rather than inventing a second one named after the Shopify handle and
+	# rewiring the existing variants onto it, which is what turned one bad product into two
+	# bogus ERPNext templates.
+	skus = [cstr(variant.get("sku")).strip() for variant in product.get("variants") or []]
+	skus = [sku for sku in skus if sku]
+	if not skus:
 		return None
-	return frappe.db.get_value(
+
+	templates = frappe.get_all(
 		"Shopify Item Link",
-		{"store": store, "product_gid": gid, "template_item": ("is", "set")},
-		"template_item",
+		filters={"store": store, "item_code": ["in", skus], "template_item": ("is", "set")},
+		pluck="template_item",
+		distinct=True,
 	)
+	if len(templates) == 1:
+		frappe.logger("shopify_integration").info(
+			f"Recognised {gid or 'an incoming product'} as {templates[0]} by its SKUs; not "
+			"creating another template for it."
+		)
+		return templates[0]
+	if len(templates) > 1:
+		frappe.logger("shopify_integration").warning(
+			f"{gid or 'An incoming product'} carries SKUs belonging to several ERPNext "
+			f"templates ({', '.join(sorted(templates))}). Leaving it for someone to sort out "
+			"rather than guessing which range it is."
+		)
+	return None
 
 
 def template_item_code(product: dict) -> str:

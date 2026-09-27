@@ -159,12 +159,7 @@ def push_products(store: str, rows: list[dict]) -> None:
 		if not item_code or not frappe.db.exists("Item", item_code):
 			continue
 
-		link = frappe.db.get_value(
-			"Shopify Item Link",
-			{"store": store, "item_code": item_code},
-			["product_gid", "is_variant", "template_item"],
-			as_dict=True,
-		)
+		link = product_link_for(store, item_code)
 		if not link or not link.product_gid:
 			if _attach_to_published_template(client, store, item_code):
 				continue
@@ -204,7 +199,7 @@ def push_products(store: str, rows: list[dict]) -> None:
 		# publishing -- one created before it did so. Once the decision is recorded, no later
 		# save costs an extra call, and none revisits it: a product that is ACTIVE and off the
 		# channel was taken off by the merchant, and an ERPNext save must not overrule that.
-		pending = payload["status"] == "ACTIVE" and not _publish_decided(link.name)
+		pending = payload["status"] == "ACTIVE" and not _publish_decided(store, link.product_gid)
 		was = _shopify_status(client, link.product_gid) if pending else None
 
 		client.execute(load_query("product_update"), {"product": payload}, cost_hint=10)
@@ -302,6 +297,26 @@ def _should_publish(store: str, item_code: str) -> bool:
 
 def _create_product(client: ShopifyClient, store: str, item_code: str) -> str | None:
 	"""Create the Shopify product for an ERPNext item, and link the two.
+
+	Held behind a lock and re-checked inside it. Creating a product is the one operation here
+	that cannot be undone by doing it again -- a second product is a second listing, and
+	Shopify will happily make one. Two drains claiming rows for the same item, or a retry
+	racing the row that is already running, would otherwise each find no link and each create.
+	"""
+	from frappe.utils.synchronization import filelock
+
+	with filelock(f"shopify-create-product-{store}-{item_code}"[:120], timeout=60):
+		existing = product_link_for(store, item_code)
+		if existing and existing.product_gid:
+			frappe.logger("shopify_integration").info(
+				f"{item_code} is already {existing.product_gid} on {store}; not creating a second."
+			)
+			return existing.product_gid
+		return _create_product_unlocked(client, store, item_code)
+
+
+def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) -> str | None:
+	"""The creation itself. Only ever called with the lock held -- see _create_product.
 
 	Two calls, because Shopify splits them: ``productCreate`` makes the product and its one
 	default variant, and only ``productVariantsBulkUpdate`` can give that variant a SKU, a
@@ -521,8 +536,49 @@ def _reread(client: ShopifyClient, product_gid: str) -> dict | None:
 _publish_pending: dict[str, bool] = {}
 
 
-def _publish_decided(link_name: str) -> bool:
-	return bool(frappe.db.get_value("Shopify Item Link", link_name, "online_store_publish_done"))
+def product_link_for(store: str, item_code: str) -> frappe._dict | None:
+	"""The Shopify product an ERPNext item belongs to, template or not.
+
+	A template has no link of its own -- only its variants do, each recording ``template_item``.
+	Looking one up by item_code alone therefore found nothing for a template, concluded it had
+	never been published, and created a **second** Shopify product for it. That duplicate came
+	back through products/create as an unknown product, was imported as two more ERPNext
+	templates, and took the original's five variant links with it.
+
+	Any one of the variants' links will do: they all name the same product, and the product is
+	what the caller is after.
+	"""
+	fields = ["name", "product_gid", "is_variant", "template_item"]
+
+	link = frappe.db.get_value(
+		"Shopify Item Link", {"store": store, "item_code": item_code}, fields, as_dict=True
+	)
+	if link and link.product_gid:
+		return link
+
+	through_variants = frappe.get_all(
+		"Shopify Item Link",
+		filters={"store": store, "template_item": item_code, "product_gid": ["is", "set"]},
+		fields=fields,
+		order_by="creation asc",
+		limit=1,
+	)
+	return through_variants[0] if through_variants else None
+
+
+def _publish_decided(store: str, product_gid: str) -> bool:
+	"""Whether this app has already made its one publish decision for a product.
+
+	Asked of the product, not of a link. A template's links are its variants', so a
+	link-keyed question is unanswerable for exactly the products this matters most for.
+	"""
+	return bool(
+		product_gid
+		and frappe.db.exists(
+			"Shopify Item Link",
+			{"store": store, "product_gid": product_gid, "online_store_publish_done": 1},
+		)
+	)
 
 
 def _mark_publish_decided(store: str, product_gid: str) -> None:
