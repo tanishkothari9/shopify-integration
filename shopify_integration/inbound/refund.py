@@ -165,14 +165,48 @@ def create_credit_note(store_doc, refund: dict) -> dict:
 	credit_note = _build_return_invoice(store_doc, refund, invoice_name, quantities, side)
 	delivery_return = _restock(store_doc, refund, order_gid, quantities)
 	payment = _reverse_payment(store_doc, credit_note, refund, side)
-	closed = settle_after_refund(store_doc, refund)
+	settled, settle_warning = _settle_safely(store_doc, refund)
 
-	return {
+	result = {
 		"credit_note": credit_note,
 		"return_delivery_note": delivery_return,
 		"payment_entry": payment,
-		"closed_sales_order": closed,
+		"closed_sales_order": settled,
 	}
+	if settle_warning:
+		result["warning"] = settle_warning
+	return result
+
+
+def _settle_safely(store_doc, refund: dict) -> tuple[str | None, str | None]:
+	"""Bring the Sales Order in line, but never at the cost of the refund itself.
+
+	The credit note and the reversing payment are what must survive. Settling the order is
+	housekeeping on top of them, and ERPNext can refuse it for reasons that say nothing about
+	whether the money went back -- a fully billed line cannot be shortened, for one. Before
+	this, that refusal rolled the whole handler back: no credit note, no payment, and an Error
+	logged against an order Shopify had genuinely refunded.
+
+	Returns the Sales Order it settled, and a warning to record if it could not.
+	"""
+	save_point = "shopify_settle_after_refund"
+	frappe.db.savepoint(save_point)
+	try:
+		settled = settle_after_refund(store_doc, refund)
+	except Exception as exc:
+		frappe.db.rollback(save_point=save_point)
+		warning = (
+			f"The refund was recorded, but the Sales Order could not be brought in line with it: "
+			f"{exc}. The credit note and refund payment are correct; the order may still reserve "
+			"stock for goods that will not be delivered."
+		)
+		frappe.logger("shopify_integration").warning(warning)
+		return None, warning
+
+	# Released here rather than in an `else`, because a `return` inside the `try` would skip
+	# an `else` and leak the savepoint.
+	frappe.db.release_savepoint(save_point)
+	return settled, None
 
 
 def owed_by_sku(order: dict) -> dict[str, int]:
@@ -298,9 +332,23 @@ def _shrink_to_what_is_owed(store_doc, name: str, owed: dict[str, int]) -> str |
 		for row in sales_order.items
 	]
 
-	with inbound_write():
-		update_child_qty_rate("Sales Order", frappe.as_json(payload), name)
+	save_point = "shopify_shrink_sales_order"
+	frappe.db.savepoint(save_point)
+	try:
+		with inbound_write():
+			update_child_qty_rate("Sales Order", frappe.as_json(payload), name)
+	except Exception as exc:
+		# ERPNext refuses some perfectly ordinary shapes -- a line already billed in full, for
+		# one. Leaving the quantity is a worse order than a shortened one, but it is a great
+		# deal better than losing the refund that prompted it.
+		frappe.db.rollback(save_point=save_point)
+		frappe.logger("shopify_integration").warning(
+			f"{name}: could not reduce the refunded lines -- {exc}. The refund itself is "
+			"recorded; the order still reserves stock for the refunded units."
+		)
+		return None
 
+	frappe.db.release_savepoint(save_point)
 	_push_released_stock(store_doc, name)
 	frappe.logger("shopify_integration").info(
 		f"{name}: reduced {len(changes)} line(s) to what Shopify still owes after a partial refund"
@@ -461,7 +509,13 @@ def _build_return_invoice(store_doc, refund: dict, invoice_name: str, quantities
 
 		credit_note.set("items", [])
 		for row in kept:
-			credit_note.append("items", row.as_dict())
+			appended = credit_note.append("items", row.as_dict())
+			# Keep the link back to the Sales Order line explicitly. It is what makes ERPNext
+			# lower the order's billed amount for the refunded quantity -- and without that the
+			# line can never be shortened afterwards: "Cannot set Rate if the billed amount is
+			# greater than the amount for Item".
+			appended.sales_order = row.get("sales_order")
+			appended.so_detail = row.get("so_detail")
 
 		_apply_refund_taxes(store_doc, credit_note, refund, quantities, side)
 
