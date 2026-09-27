@@ -165,7 +165,7 @@ def create_credit_note(store_doc, refund: dict) -> dict:
 	credit_note = _build_return_invoice(store_doc, refund, invoice_name, quantities, side)
 	delivery_return = _restock(store_doc, refund, order_gid, quantities)
 	payment = _reverse_payment(store_doc, credit_note, refund, side)
-	closed = close_if_fully_refunded(store_doc, refund)
+	closed = settle_after_refund(store_doc, refund)
 
 	return {
 		"credit_note": credit_note,
@@ -175,22 +175,45 @@ def create_credit_note(store_doc, refund: dict) -> dict:
 	}
 
 
-def close_if_fully_refunded(store_doc, refund: dict) -> str | None:
-	"""Close the Sales Order once Shopify says nothing on it is still owed.
+def owed_by_sku(order: dict) -> dict[str, int]:
+	"""Per SKU, how many units Shopify still expects to be delivered.
 
-	A return Delivery Note puts ``delivered_qty`` back down, and nothing else closes the order.
-	So a delivered order that is refunded in full drops from Completed back to "To Deliver",
-	**reserves its stock again**, and reappears on the staff list where someone could ship it a
-	second time. Because availability is pushed as on-hand minus reserved, the website then
-	shows one piece fewer for every refunded order, permanently. An order refunded before it
-	ever shipped leaks the same reservation without any return note being involved.
+	Two numbers, and the smaller wins. ``currentQuantity`` is what is left on the order after
+	every refund; ``unfulfilledQuantity`` is what has not shipped. A unit still owed is one
+	that is both. Taking the minimum is right whichever way Shopify accounts for a refunded
+	unit that had already shipped, which is the case that started this: two earrings
+	delivered, one returned and refunded, one kept. ``currentQuantity`` is 1 there and reads
+	as "something is still owed", but nothing is -- both shipped, and one came back.
+	"""
+	owed: dict[str, int] = {}
+	for line in (order.get("lineItems") or {}).get("nodes") or []:
+		sku = cstr(line.get("sku")).strip()
+		if not sku:
+			continue
+		remaining = min(cint(line.get("currentQuantity")), cint(line.get("unfulfilledQuantity")))
+		owed[sku] = owed.get(sku, 0) + max(remaining, 0)
+	return owed
 
-	Closing is what releases it -- ERPNext's own ``update_status`` recalculates ``reserved_qty``
-	as part of the change.
 
-	Judged on ``currentQuantity``, which Shopify states per line as what remains after *every*
-	refund against that order, so a second partial refund closes the order exactly when the last
-	unit goes and not before. A partly refunded order still owes the rest and is left open.
+def settle_after_refund(store_doc, refund: dict) -> str | None:
+	"""Bring the Sales Order back in line with what Shopify still owes.
+
+	A return Delivery Note puts ``delivered_qty`` back down, and nothing else adjusts the
+	order. So a delivered order that is refunded drops from Completed back to "To Deliver",
+	**reserves the returned stock again**, and reappears on the staff list where someone could
+	ship it a second time. Because availability is pushed as on-hand minus reserved, the
+	website shows one piece fewer for every refunded order, permanently. An order refunded
+	before it ever shipped leaks the same reservation with no return note involved.
+
+	Two outcomes, depending on what is left:
+
+	* **Nothing owed** -- every unit either shipped and stayed, or was refunded. The order is
+	  closed, which is what makes ERPNext recalculate ``reserved_qty``.
+	* **Something owed** -- part of an unshipped order was refunded. The order stays open,
+	  because the rest is still coming, but the refunded units are taken off its lines so the
+	  reservation matches what will actually be delivered.
+
+	Returns the Sales Order it touched, or None.
 	"""
 	order = refund.get("order") or {}
 	order_gid = order.get("id")
@@ -199,12 +222,9 @@ def close_if_fully_refunded(store_doc, refund: dict) -> str | None:
 
 	lines = (order.get("lineItems") or {}).get("nodes") or []
 	if not lines:
-		# No line data to judge by -- an older payload, or a refund of shipping only. Leaving the
-		# order open is the safe half of the guess: a stuck reservation is visible and fixable,
-		# closing an order that still owes goods is not.
-		return None
-
-	if any(cint(line.get("currentQuantity")) > 0 for line in lines):
+		# No line data to judge by -- an older payload, or a refund of shipping only. Leaving
+		# the order alone is the safe half of the guess: a stuck reservation is visible and
+		# fixable, closing or shrinking an order that still owes goods is not.
 		return None
 
 	name = frappe.db.get_value(
@@ -222,12 +242,69 @@ def close_if_fully_refunded(store_doc, refund: dict) -> str | None:
 		# genuinely finished and holds no reservation to release.
 		return None
 
+	owed = owed_by_sku(order)
+
+	if not any(owed.values()):
+		with inbound_write():
+			sales_order = frappe.get_doc("Sales Order", name)
+			mark(sales_order)
+			sales_order.update_status("Closed")
+		_push_released_stock(store_doc, name)
+		return name
+
+	return _shrink_to_what_is_owed(store_doc, name, owed)
+
+
+def _shrink_to_what_is_owed(store_doc, name: str, owed: dict[str, int]) -> str | None:
+	"""Take refunded units off an order that is still partly outstanding.
+
+	Leaving them on holds stock for goods nobody is going to receive. A line is only ever
+	reduced, never raised, and never below what has already gone out -- ERPNext would refuse
+	that, and it would be wrong anyway.
+	"""
+	from erpnext.controllers.accounts_controller import update_child_qty_rate
+
+	sales_order = frappe.get_doc("Sales Order", name)
+	changes, blocked = [], []
+
+	for row in sales_order.items:
+		wanted = owed.get(cstr(row.item_code).strip())
+		if wanted is None or wanted >= flt(row.qty):
+			continue
+		if wanted < flt(row.delivered_qty or 0):
+			blocked.append(f"{row.item_code} ({row.delivered_qty} already delivered, {wanted} owed)")
+			continue
+		changes.append(
+			{"docname": row.name, "item_code": row.item_code, "qty": wanted, "rate": flt(row.rate)}
+		)
+
+	if blocked:
+		frappe.logger("shopify_integration").warning(
+			f"{name}: cannot reduce {', '.join(blocked)} -- more has been delivered than Shopify "
+			"still owes. Someone should look at whether a return note is missing."
+		)
+
+	if not changes:
+		return None
+
+	# Rows that are not changing still have to be sent; update_child_qty_rate treats the list
+	# as the whole table and drops anything missing from it.
+	by_docname = {change["docname"]: change for change in changes}
+	payload = [
+		by_docname.get(
+			row.name,
+			{"docname": row.name, "item_code": row.item_code, "qty": flt(row.qty), "rate": flt(row.rate)},
+		)
+		for row in sales_order.items
+	]
+
 	with inbound_write():
-		sales_order = frappe.get_doc("Sales Order", name)
-		mark(sales_order)
-		sales_order.update_status("Closed")
+		update_child_qty_rate("Sales Order", frappe.as_json(payload), name)
 
 	_push_released_stock(store_doc, name)
+	frappe.logger("shopify_integration").info(
+		f"{name}: reduced {len(changes)} line(s) to what Shopify still owes after a partial refund"
+	)
 	return name
 
 

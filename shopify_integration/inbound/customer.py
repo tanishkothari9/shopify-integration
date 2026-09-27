@@ -71,6 +71,10 @@ def customer_email(shopify_customer: dict) -> str | None:
 	return normalise_email(shopify_customer.get("email"))
 
 
+def _customers_on(rows) -> list[str]:
+	return [row.customer for row in rows if row.customer]
+
+
 def _matched(customers: list[str], identifier: str, kind: str) -> str | None:
 	"""One customer from a match, or None when the identifier is too common to trust."""
 	customers = [customer for customer in customers if customer]
@@ -120,7 +124,7 @@ def find_customer_by_mobile(number: str) -> str | None:
 		{"number": number},
 		as_dict=True,
 	)
-	return _matched([row.customer for row in matches], number, "Mobile")
+	return _matched(_customers_on(matches), number, "Mobile")
 
 
 def find_customer_by_email(email: str) -> str | None:
@@ -153,7 +157,7 @@ def find_customer_by_email(email: str) -> str | None:
 		{"email": email},
 		as_dict=True,
 	)
-	return _matched([row.customer for row in matches], email, "Email")
+	return _matched(_customers_on(matches), email, "Email")
 
 
 def _oldest(customers: list[str]) -> str | None:
@@ -202,7 +206,8 @@ def resolve_customer(store_doc, order: dict) -> str:
 		# addresses were only ever written on the branch that creates the customer, and that
 		# branch had already been taken by the other webhook.
 		#
-		# _write_address dedupes on title, so a repeat customer does not accumulate copies.
+		# _write_address matches on content, so a repeat order to the same place reuses the
+		# address and a new place gets a new one.
 		with inbound_write():
 			_write_address(existing, order.get("shippingAddress"), "Shipping")
 			_write_address(existing, order.get("billingAddress"), "Billing")
@@ -365,24 +370,91 @@ def default_territory() -> str:
 	return frappe.db.get_value("Territory", {"is_group": 0}, "name")
 
 
+def order_addresses(customer: str, order: dict) -> dict:
+	"""The Address records *this* order ships and bills to.
+
+	Returned so the documents can point at them. A repeat customer ordering somewhere new was
+	otherwise given the address from their first order for ever: the parcel would go to the
+	wrong place, and -- because place of supply follows the address -- an order to another
+	state was refused outright by india_compliance with "Cannot charge IGST for intra-state
+	supplies".
+	"""
+	with inbound_write():
+		return {
+			"shipping": _write_address(customer, order.get("shippingAddress"), "Shipping"),
+			"billing": _write_address(customer, order.get("billingAddress"), "Billing"),
+		}
+
+
+def _address_values(address: dict) -> dict:
+	"""Shopify's address in ERPNext's field names, trimmed to their column widths."""
+	return {
+		"address_line1": cstr(address.get("address1"))[:240],
+		"address_line2": cstr(address.get("address2"))[:240] or None,
+		"city": cstr(address.get("city"))[:100] or "Unknown",
+		"state": cstr(address.get("province"))[:100] or None,
+		"pincode": cstr(address.get("zip"))[:20] or None,
+		"country": _country(address),
+		"phone": cstr(address.get("phone"))[:20] or None,
+	}
+
+
+#: The fields that decide whether two addresses are the same place.
+ADDRESS_FIELDS = ("address_line1", "address_line2", "city", "state", "pincode", "country", "phone")
+
+
+def _address_key(values: dict) -> str:
+	"""A comparable form of an address: case, spacing and punctuation do not make it new."""
+	return "|".join(" ".join(cstr(values.get(field)).split()).casefold() for field in ADDRESS_FIELDS)
+
+
+def _matching_address(customer: str, values: dict, address_type: str) -> str | None:
+	"""An address of this customer that is already this place, or None.
+
+	Matched on content rather than on a title, which is what the first version did -- and a
+	title is the same for every address a customer ever has, so the second one was thrown away.
+	"""
+	rows = frappe.db.sql(
+		"""
+		SELECT a.name, a.address_line1, a.address_line2, a.city, a.state, a.pincode,
+		       a.country, a.phone
+		FROM `tabAddress` a
+		JOIN `tabDynamic Link` link
+		  ON link.parent = a.name
+		 AND link.parenttype = 'Address'
+		 AND link.link_doctype = 'Customer'
+		WHERE link.link_name = %(customer)s
+		  AND a.address_type = %(address_type)s
+		  AND IFNULL(a.disabled, 0) = 0
+		""",
+		{"customer": customer, "address_type": address_type},
+		as_dict=True,
+	)
+
+	wanted = _address_key(values)
+	for row in rows:
+		if _address_key(row) == wanted:
+			return row.name
+	return None
+
+
 def _write_address(customer: str, address: dict | None, address_type: str) -> str | None:
+	"""This order's address: the one the customer already has, or a new one."""
 	if not address or not cstr(address.get("address1")).strip():
 		return None
 
-	title = f"{customer}-{address_type}"[:140]
-	if frappe.db.exists("Address", {"address_title": title, "address_type": address_type}):
-		return None
+	values = _address_values(address)
+	existing = _matching_address(customer, values, address_type)
+	if existing:
+		return existing
 
 	doc = frappe.new_doc("Address")
-	doc.address_title = title
+	# The city in the title so a customer with several can tell them apart on the form.
+	# ERPNext appends the type, and a counter if that still collides.
+	doc.address_title = f"{customer}-{values['city']}"[:140]
 	doc.address_type = address_type
-	doc.address_line1 = cstr(address.get("address1"))[:240]
-	doc.address_line2 = cstr(address.get("address2"))[:240] or None
-	doc.city = cstr(address.get("city"))[:100] or "Unknown"
-	doc.state = cstr(address.get("province"))[:100] or None
-	doc.pincode = cstr(address.get("zip"))[:20] or None
-	doc.country = _country(address)
-	doc.phone = cstr(address.get("phone"))[:20] or None
+	for field in ADDRESS_FIELDS:
+		setattr(doc, field, values[field])
 	doc.append("links", {"link_doctype": "Customer", "link_name": customer})
 	mark(doc)
 	doc.insert(ignore_permissions=True)
@@ -453,6 +525,102 @@ def _write_contact(customer: str, shopify_customer: dict) -> str | None:
 # --------------------------------------------------------------------------------------
 
 
+#: Documents whose existence means a customer has a history worth keeping.
+TRANSACTION_DOCTYPES = ("Sales Order", "Sales Invoice", "Delivery Note", "Payment Entry")
+
+
+def has_transactions(customer: str) -> bool:
+	"""Whether anything has been booked against this customer, cancelled or not."""
+	return any(
+		frappe.db.exists(doctype, {"customer": customer, "docstatus": ["!=", 0]})
+		for doctype in TRANSACTION_DOCTYPES
+	)
+
+
+def customers_matching(shopify_customer: dict, exclude: str) -> list[str]:
+	"""Other customers reachable on this buyer's mobile, or failing that their email."""
+	number = customer_mobile(shopify_customer)
+	email = customer_email(shopify_customer)
+
+	by_mobile = [c for c in (find_customer_by_mobile(number) or "",) if c and c != exclude] if number else []
+	if by_mobile:
+		return by_mobile
+	return [c for c in (find_customer_by_email(email) or "",) if c and c != exclude] if email else []
+
+
+def claim_existing_customer(store: str, created: str, shopify_customer: dict) -> str | None:
+	"""Move a Shopify account onto the customer it turns out to belong to.
+
+	Shopify's new customer accounts sign up with an email and nothing else, so the app has no
+	way to recognise the buyer and makes a new customer. The shopper then fills in their name,
+	phone and address on the website profile -- and only then is there enough to see that this
+	is somebody the shop has known for years. Without this the account stays a second, empty
+	record, and every order from the website lands on it.
+
+	The empty record is only ever the one given up. A customer with anything booked against it
+	keeps its account, because merging two histories is not something to do on a guess; that
+	case is logged for a person to look at instead.
+	"""
+	if has_transactions(created):
+		return None
+
+	candidates = customers_matching(shopify_customer, exclude=created)
+	if len(candidates) != 1:
+		return None
+
+	target = candidates[0]
+	gid = cstr(shopify_customer.get("id"))
+
+	if frappe.db.get_value("Customer", target, "shopify_customer_gid"):
+		frappe.logger("shopify_integration").warning(
+			f"{created} looks like {target}, but {target} already has a Shopify account. "
+			"Leaving both alone for someone to merge by hand."
+		)
+		return None
+
+	with inbound_write():
+		frappe.db.set_value("Customer", created, "shopify_customer_gid", None, update_modified=False)
+		frappe.db.set_value("Customer", target, "shopify_customer_gid", gid, update_modified=False)
+
+		empty = frappe.get_doc("Customer", created)
+		empty.disabled = 1
+		mark(empty)
+		empty.save(ignore_permissions=True)
+		empty.add_comment(
+			"Comment",
+			f"Disabled by the Shopify integration: this was an empty account created before the "
+			f"shopper filled in their profile, and it is the same person as {target}, which now "
+			f"holds the Shopify account.",
+		)
+
+		enrich_contact(target, shopify_customer)
+
+	frappe.logger("shopify_integration").info(
+		f"Moved Shopify customer {gid} from the empty {created} to {target}"
+	)
+	return target
+
+
+def write_profile_address(customer: str, payload: dict) -> str | None:
+	"""The address a shopper filled in on their website profile.
+
+	customers/update carries it as `default_address` in REST's spelling, which is not the
+	shape the address writer reads.
+	"""
+	rest = payload.get("default_address") or {}
+	if not rest:
+		return None
+
+	from shopify_integration.inbound.order import _address_from_payload
+
+	address = _address_from_payload(rest)
+	if not address:
+		return None
+
+	with inbound_write():
+		return _write_address(customer, address, "Shipping")
+
+
 def on_customer_create(event_log: str):
 	return _upsert_customer(event_log)
 
@@ -483,19 +651,36 @@ def _upsert_customer(event_log: str):
 		}
 
 		existing = frappe.db.get_value("Customer", {"shopify_customer_gid": gid}, "name")
+		result = {}
 		if existing:
 			with inbound_write():
 				doc = frappe.get_doc("Customer", existing)
 				doc.customer_name = customer_name(shopify_customer)
 				mark(doc)
 				doc.save(ignore_permissions=True)
-			name = existing
+				# The details a shopper adds to their profile after signing up. Without these
+				# the phone and address they typed never leave Shopify, and the account stays
+				# unrecognisable as somebody the shop already knows.
+				enrich_contact(existing, shopify_customer)
+			write_profile_address(existing, payload)
+
+			claimed = claim_existing_customer(log.store, existing, shopify_customer)
+			name = claimed or existing
+			if claimed:
+				result["merged_into"] = claimed
+				result["disabled"] = existing
 		else:
 			name = resolve_customer(store_doc, {"customer": shopify_customer})
+			write_profile_address(name, payload)
 
 		frappe.db.commit()
-		log.mark_success(ref_doctype="Customer", ref_docname=name)
-		return {"customer": name}
+		result["customer"] = name
+		log.mark_success(
+			ref_doctype="Customer",
+			ref_docname=name,
+			result=(f"merged {existing} into {name}" if result.get("merged_into") else None),
+		)
+		return result
 	except Exception:
 		log.mark_error(frappe.get_traceback())
 		raise

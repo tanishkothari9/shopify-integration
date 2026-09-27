@@ -21,7 +21,7 @@ from frappe.utils import cstr, flt
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import inbound_write, mark
-from shopify_integration.inbound.customer import resolve_customer
+from shopify_integration.inbound.customer import order_addresses, resolve_customer
 from shopify_integration.inbound.webhook import payload_of
 from shopify_integration.utils.money import quantize, to_float
 from shopify_integration.utils.taxes import (
@@ -355,6 +355,22 @@ def create_sales_order(store_doc, order: dict) -> str:
 	with inbound_write():
 		so = frappe.new_doc("Sales Order")
 		so.customer = resolve_customer(store_doc, order)
+
+		# This order's own addresses, not whichever one the customer happened to use first.
+		# The invoice and delivery note are built from the Sales Order and inherit them, so
+		# setting them here is what makes the parcel go to the right place and -- because
+		# place of supply follows the address -- what lets an order to another state be
+		# charged IGST instead of being refused.
+		addresses = order_addresses(so.customer, order)
+		if addresses["shipping"]:
+			so.shipping_address_name = addresses["shipping"]
+		if addresses["billing"]:
+			so.customer_address = addresses["billing"]
+		elif addresses["shipping"]:
+			# Shopify often carries only a shipping address. Billing to the same place is
+			# closer to the truth than billing to an address from a different order.
+			so.customer_address = addresses["shipping"]
+
 		so.company = store_doc.company
 		so.shopify_store = store_doc.name
 		so.shopify_order_gid = order_gid

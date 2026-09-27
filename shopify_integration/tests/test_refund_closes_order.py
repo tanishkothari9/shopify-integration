@@ -11,34 +11,35 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from shopify_integration.inbound.refund import close_if_fully_refunded
+from shopify_integration.inbound.refund import owed_by_sku, settle_after_refund
 from shopify_integration.tests.test_orders import OrderTestCase
 
 
 def refund_payload(order_gid, lines, name="#1075"):
 	"""A refund in the shape refund_by_id.graphql returns.
 
-	`lines` is [(sku, ordered, remaining)] -- remaining being Shopify's currentQuantity, what
-	is left on the line after every refund against the order, not just this one.
+	`lines` is [(sku, ordered, remaining)] or [(sku, ordered, remaining, unfulfilled)].
+	`remaining` is Shopify's currentQuantity -- what is left on the line after every refund
+	against the order, not just this one -- and `unfulfilled` is what has not shipped,
+	defaulting to the same so the common cases read short.
 	"""
+	nodes = []
+	for i, line in enumerate(lines, start=1):
+		sku, ordered, remaining = line[0], line[1], line[2]
+		unfulfilled = line[3] if len(line) > 3 else remaining
+		nodes.append(
+			{
+				"id": f"gid://shopify/LineItem/{i}",
+				"sku": sku,
+				"quantity": ordered,
+				"currentQuantity": remaining,
+				"unfulfilledQuantity": unfulfilled,
+			}
+		)
 	return {
 		"id": "gid://shopify/Refund/1",
 		"createdAt": "2026-09-26T20:22:49Z",
-		"order": {
-			"id": order_gid,
-			"name": name,
-			"lineItems": {
-				"nodes": [
-					{
-						"id": f"gid://shopify/LineItem/{i}",
-						"sku": sku,
-						"quantity": ordered,
-						"currentQuantity": remaining,
-					}
-					for i, (sku, ordered, remaining) in enumerate(lines, start=1)
-				]
-			},
-		},
+		"order": {"id": order_gid, "name": name, "lineItems": {"nodes": nodes}},
 	}
 
 
@@ -51,27 +52,27 @@ class TestDecidingWhetherAnythingIsStillOwed(FrappeTestCase):
 	def test_a_partly_refunded_order_is_left_open(self):
 		"""One of two lines returned. The customer is still owed the other one."""
 		refund = refund_payload("gid://shopify/Order/9001", [("TEE", 1, 0), ("MUG", 1, 1)])
-		self.assertIsNone(close_if_fully_refunded(self._Store(), refund))
+		self.assertIsNone(settle_after_refund(self._Store(), refund))
 
 	def test_a_partly_refunded_line_is_left_open(self):
 		"""Two of three units back; one is still owed."""
 		refund = refund_payload("gid://shopify/Order/9002", [("TEE", 3, 1)])
-		self.assertIsNone(close_if_fully_refunded(self._Store(), refund))
+		self.assertIsNone(settle_after_refund(self._Store(), refund))
 
 	def test_a_refund_with_no_line_data_changes_nothing(self):
 		"""Shipping-only refunds and older payloads. Leaving it open is the safe half of the
 		guess: a stuck reservation is visible and fixable, closing an order that still owes
 		goods is not."""
 		refund = {"id": "r", "order": {"id": "gid://shopify/Order/9003", "lineItems": {"nodes": []}}}
-		self.assertIsNone(close_if_fully_refunded(self._Store(), refund))
+		self.assertIsNone(settle_after_refund(self._Store(), refund))
 
 	def test_a_refund_naming_no_order_changes_nothing(self):
-		self.assertIsNone(close_if_fully_refunded(self._Store(), {"id": "r", "order": {}}))
-		self.assertIsNone(close_if_fully_refunded(self._Store(), {"id": "r"}))
+		self.assertIsNone(settle_after_refund(self._Store(), {"id": "r", "order": {}}))
+		self.assertIsNone(settle_after_refund(self._Store(), {"id": "r"}))
 
 	def test_an_order_this_site_does_not_have_changes_nothing(self):
 		refund = refund_payload("gid://shopify/Order/does-not-exist", [("TEE", 1, 0)])
-		self.assertIsNone(close_if_fully_refunded(self._Store(), refund))
+		self.assertIsNone(settle_after_refund(self._Store(), refund))
 
 
 class TestTheEventLogFitsItsColumn(FrappeTestCase):
@@ -187,7 +188,7 @@ class TestClosingARealSalesOrder(OrderTestCase):
 
 		self.assertGreater(self._reserved("ORD-TEE"), before, "the order should reserve while open")
 
-		closed = close_if_fully_refunded(self.store_doc, refund_payload(gid, [("ORD-TEE", 1, 0)]))
+		closed = settle_after_refund(self.store_doc, refund_payload(gid, [("ORD-TEE", 1, 0)]))
 		frappe.db.commit()
 
 		self.assertEqual(closed, name)
@@ -220,7 +221,7 @@ class TestClosingARealSalesOrder(OrderTestCase):
 		frappe.db.delete("Shopify Sync Queue", {"store": self.store})
 		frappe.db.commit()
 
-		close_if_fully_refunded(
+		settle_after_refund(
 			frappe.get_cached_doc("Shopify Store", self.store), refund_payload(gid, [("ORD-TEE", 1, 0)])
 		)
 		frappe.db.commit()
@@ -243,23 +244,50 @@ class TestClosingARealSalesOrder(OrderTestCase):
 		name = self._sales_order(gid)
 		refund = refund_payload(gid, [("ORD-TEE", 1, 0)])
 
-		self.assertEqual(close_if_fully_refunded(self.store_doc, refund), name)
+		self.assertEqual(settle_after_refund(self.store_doc, refund), name)
 		frappe.db.commit()
-		self.assertIsNone(close_if_fully_refunded(self.store_doc, refund), "must be idempotent")
+		self.assertIsNone(settle_after_refund(self.store_doc, refund), "must be idempotent")
 		self.assertEqual(frappe.db.get_value("Sales Order", name, "status"), "Closed")
 
-	def test_a_partly_refunded_order_keeps_its_reservation(self):
-		"""It still owes the rest, so it must stay open and stay reserved."""
+	def test_a_partly_refunded_unshipped_order_is_shrunk_to_what_is_owed(self):
+		"""Three ordered, one refunded before anything shipped. The order stays open because
+		two are still coming, but holding three reserves stock for a unit nobody will get."""
 		gid = "gid://shopify/Order/9104"
 		before = self._reserved("ORD-TEE")
 		name = self._sales_order(gid, qty=3)
-		reserved_while_open = self._reserved("ORD-TEE")
+		self.assertEqual(self._reserved("ORD-TEE"), before + 3)
 
-		self.assertIsNone(close_if_fully_refunded(self.store_doc, refund_payload(gid, [("ORD-TEE", 3, 1)])))
+		self.assertEqual(settle_after_refund(self.store_doc, refund_payload(gid, [("ORD-TEE", 3, 2)])), name)
 		frappe.db.commit()
+
 		self.assertNotEqual(frappe.db.get_value("Sales Order", name, "status"), "Closed")
-		self.assertEqual(self._reserved("ORD-TEE"), reserved_while_open)
-		self.assertGreater(reserved_while_open, before)
+		self.assertEqual(frappe.get_doc("Sales Order", name).items[0].qty, 2)
+		self.assertEqual(self._reserved("ORD-TEE"), before + 2, "only what is still owed")
+
+	def test_a_delivered_order_partly_returned_is_closed(self):
+		"""#1122: two delivered, one returned and refunded, one kept. currentQuantity is 1 and
+		reads as "something is owed", but nothing is -- both shipped and one came back."""
+		gid = "gid://shopify/Order/9107"
+		before = self._reserved("ORD-TEE")
+		name = self._sales_order(gid, qty=2)
+
+		self.assertEqual(
+			settle_after_refund(self.store_doc, refund_payload(gid, [("ORD-TEE", 2, 1, 0)])), name
+		)
+		frappe.db.commit()
+
+		self.assertEqual(frappe.db.get_value("Sales Order", name, "status"), "Closed")
+		self.assertEqual(self._reserved("ORD-TEE"), before, "the returned piece goes back on sale")
+
+	def test_an_order_with_nothing_refunded_is_left_alone(self):
+		gid = "gid://shopify/Order/9108"
+		name = self._sales_order(gid, qty=2)
+		reserved = self._reserved("ORD-TEE")
+
+		self.assertIsNone(settle_after_refund(self.store_doc, refund_payload(gid, [("ORD-TEE", 2, 2)])))
+		frappe.db.commit()
+		self.assertEqual(frappe.get_doc("Sales Order", name).items[0].qty, 2)
+		self.assertEqual(self._reserved("ORD-TEE"), reserved)
 
 	def test_a_cancelled_order_is_left_alone(self):
 		gid = "gid://shopify/Order/9105"
@@ -267,7 +295,7 @@ class TestClosingARealSalesOrder(OrderTestCase):
 		frappe.get_doc("Sales Order", name).cancel()
 		frappe.db.commit()
 
-		self.assertIsNone(close_if_fully_refunded(self.store_doc, refund_payload(gid, [("ORD-TEE", 1, 0)])))
+		self.assertIsNone(settle_after_refund(self.store_doc, refund_payload(gid, [("ORD-TEE", 1, 0)])))
 
 	def test_another_stores_order_is_not_touched(self):
 		"""Only Sales Orders this store owns."""
@@ -276,7 +304,7 @@ class TestClosingARealSalesOrder(OrderTestCase):
 		frappe.db.set_value("Sales Order", name, "shopify_store", "Test Store B", update_modified=False)
 		frappe.db.commit()
 
-		self.assertIsNone(close_if_fully_refunded(self.store_doc, refund_payload(gid, [("ORD-TEE", 1, 0)])))
+		self.assertIsNone(settle_after_refund(self.store_doc, refund_payload(gid, [("ORD-TEE", 1, 0)])))
 		self.assertNotEqual(frappe.db.get_value("Sales Order", name, "status"), "Closed")
 
 
@@ -556,3 +584,39 @@ class TestCancellingAnUnpaidOrderWithRestock(FrappeTestCase):
 		with self.assertRaises(frappe.ValidationError) as caught:
 			create_credit_note(store, self._refund(amount="499.00"))
 		self.assertIn("no Sales Invoice", str(caught.exception))
+
+
+class TestWorkingOutWhatIsOwed(FrappeTestCase):
+	"""The measure the whole thing turns on."""
+
+	def test_a_shipped_and_returned_unit_is_not_owed(self):
+		"""#1122. currentQuantity says 1, unfulfilled says 0, and 0 is the answer."""
+		order = refund_payload("gid://shopify/Order/1", [("EAR", 2, 1, 0)])["order"]
+		self.assertEqual(owed_by_sku(order), {"EAR": 0})
+
+	def test_an_unshipped_partly_refunded_line_is_owed_what_is_left(self):
+		order = refund_payload("gid://shopify/Order/1", [("EAR", 3, 2, 2)])["order"]
+		self.assertEqual(owed_by_sku(order), {"EAR": 2})
+
+	def test_a_fully_refunded_line_is_owed_nothing(self):
+		order = refund_payload("gid://shopify/Order/1", [("EAR", 2, 0, 0)])["order"]
+		self.assertEqual(owed_by_sku(order), {"EAR": 0})
+
+	def test_an_untouched_line_is_owed_in_full(self):
+		order = refund_payload("gid://shopify/Order/1", [("EAR", 2, 2, 2)])["order"]
+		self.assertEqual(owed_by_sku(order), {"EAR": 2})
+
+	def test_the_smaller_of_the_two_always_wins(self):
+		"""Whichever way Shopify accounts for a refunded unit that had already shipped."""
+		order = refund_payload("gid://shopify/Order/1", [("EAR", 5, 4, 1)])["order"]
+		self.assertEqual(owed_by_sku(order), {"EAR": 1})
+		order = refund_payload("gid://shopify/Order/1", [("EAR", 5, 1, 4)])["order"]
+		self.assertEqual(owed_by_sku(order), {"EAR": 1})
+
+	def test_lines_without_a_sku_are_ignored(self):
+		order = refund_payload("gid://shopify/Order/1", [("", 2, 2, 2)])["order"]
+		self.assertEqual(owed_by_sku(order), {})
+
+	def test_two_lines_of_the_same_sku_add_up(self):
+		order = refund_payload("gid://shopify/Order/1", [("EAR", 1, 1, 1), ("EAR", 2, 2, 2)])["order"]
+		self.assertEqual(owed_by_sku(order), {"EAR": 3})
