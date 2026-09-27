@@ -338,15 +338,24 @@ def _shrink_to_what_is_owed(store_doc, name: str, owed: dict[str, int]) -> str |
 		with inbound_write():
 			update_child_qty_rate("Sales Order", frappe.as_json(payload), name)
 	except Exception as exc:
-		# ERPNext refuses some perfectly ordinary shapes -- a line already billed in full, for
-		# one. Leaving the quantity is a worse order than a shortened one, but it is a great
-		# deal better than losing the refund that prompted it.
+		# ERPNext refuses this for a line that is already billed in full, and there is no way
+		# round it: the check is `billed_amt > rate * qty` whatever the rate does, and ERPNext
+		# does not reduce a Sales Order's billed amount when a credit note is raised against
+		# it -- verified against v15, with the credit note's so_detail correctly set.
+		#
+		# Raised rather than swallowed so it reaches the event log through _settle_safely. The
+		# refund is already safe there; what is left is making sure somebody can see that the
+		# order still reserves stock it should not.
 		frappe.db.rollback(save_point=save_point)
-		frappe.logger("shopify_integration").warning(
-			f"{name}: could not reduce the refunded lines -- {exc}. The refund itself is "
-			"recorded; the order still reserves stock for the refunded units."
+		frappe.throw(
+			_(
+				"{0}: the refunded units could not be taken off the order -- {1}. This happens "
+				"when the line is already invoiced in full: ERPNext will not shorten a line "
+				"below what has been billed, and a credit note does not reduce that. The refund "
+				"itself is recorded correctly. Until someone shortens or closes the order by "
+				"hand it will keep reserving stock for the refunded units."
+			).format(name, exc)
 		)
-		return None
 
 	frappe.db.release_savepoint(save_point)
 	_push_released_stock(store_doc, name)
