@@ -152,7 +152,7 @@ def _upsert_item(item_code: str, product: dict, variant: dict, item_group: str, 
 	item.description = product.get("description") or item.item_name
 	item.disabled = 1 if product.get("status") == "ARCHIVED" else 0
 	_apply_weight(item, variant)
-	_apply_supplier(item, product)
+	_apply_supplier(item, product, store)
 
 	mark(item)
 	item.save(ignore_permissions=True)
@@ -173,7 +173,7 @@ def _upsert_template(template_code: str, product: dict, attributes: list[str], i
 	item.item_name = product.get("title") or template_code
 	item.description = product.get("description") or item.item_name
 	item.disabled = 1 if product.get("status") == "ARCHIVED" else 0
-	_apply_supplier(item, product)
+	_apply_supplier(item, product, store)
 
 	present = {row.attribute for row in (item.attributes or [])}
 	for attribute in attributes:
@@ -305,13 +305,51 @@ def _apply_weight(item, variant: dict) -> None:
 	item.weight_uom = ensure_uom(WEIGHT_UOM[unit])
 
 
-def _apply_supplier(item, product: dict) -> None:
+def _apply_supplier(item, product: dict, store: str) -> None:
+	"""Record Shopify's Vendor as a Supplier on the item -- if the merchant asked for that.
+
+	Off unless a store opts in, because Shopify's Vendor is not a supplier field. Left alone
+	it holds the shop's own name, so on a live store this created a Supplier called "Smart
+	Choice" and attached it to every product the shop sells to itself. A Supplier is a real
+	accounting record with a ledger behind it; inventing one from a display field is not
+	something to do by default.
+
+	And never for the shop's own name even when the setting is on. A product published from
+	ERPNext comes back through products/create carrying whatever Vendor we sent or Shopify
+	defaulted to, which is exactly the value that must not become a Supplier.
+	"""
 	vendor = cstr(product.get("vendor")).strip()
 	if not vendor:
 		return
+
+	if not frappe.db.get_value("Shopify Store", store, "create_suppliers_from_vendor"):
+		return
+
+	if _is_the_shop_itself(vendor, store):
+		frappe.logger("shopify_integration").info(
+			f"Not making a Supplier from vendor {vendor!r}: that is this shop, not someone it buys from."
+		)
+		return
+
 	supplier = ensure_supplier(vendor)
 	if not any(row.supplier == supplier for row in (item.supplier_items or [])):
 		item.append("supplier_items", {"supplier": supplier})
+
+
+def _is_the_shop_itself(vendor: str, store: str) -> bool:
+	"""Whether this vendor name is just the shop's own, however it is spelled."""
+	settings = (
+		frappe.db.get_value("Shopify Store", store, ["store_name", "shop_domain"], as_dict=True)
+		or frappe._dict()
+	)
+
+	subdomain = cstr(settings.get("shop_domain")).split(".")[0]
+	ours = {
+		cstr(value).strip().casefold()
+		for value in (store, settings.get("store_name"), settings.get("shop_domain"), subdomain)
+		if cstr(value).strip()
+	}
+	return vendor.strip().casefold() in ours
 
 
 # --------------------------------------------------------------------------------------
@@ -479,12 +517,32 @@ def default_stock_uom() -> str:
 
 
 def ensure_supplier(name: str) -> str:
+	"""The Supplier of this name, creating it if nobody has yet.
+
+	Two products/update webhooks arriving together both found no Supplier and both inserted,
+	and the loser died on the unique name. Whoever got there first is the right answer for
+	both, so the collision is caught rather than raised: the caller wanted a name, and the
+	name now exists.
+	"""
 	if frappe.db.exists("Supplier", name):
 		return name
+
+	save_point = "shopify_ensure_supplier"
+	frappe.db.savepoint(save_point)
 	supplier = frappe.new_doc("Supplier")
 	supplier.supplier_name = name
 	mark(supplier)
-	supplier.insert(ignore_permissions=True)
+	try:
+		supplier.insert(ignore_permissions=True)
+	except frappe.DuplicateEntryError:
+		# Rolled back to the savepoint rather than caught bare: a failed insert leaves the
+		# transaction dirty, and everything else this webhook is doing still has to commit.
+		frappe.db.rollback(save_point=save_point)
+		return name
+
+	# Released after the try, not in an `else`: a `return` inside the `try` would skip an
+	# `else` and leak the savepoint.
+	frappe.db.release_savepoint(save_point)
 	return supplier.name
 
 

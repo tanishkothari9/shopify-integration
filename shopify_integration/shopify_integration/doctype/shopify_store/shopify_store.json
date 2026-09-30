@@ -47,6 +47,7 @@
   "sync_inventory",
   "sync_items",
   "sync_item_titles",
+  "create_suppliers_from_vendor",
   "column_break_outbound",
   "sync_prices",
   "publish_new_items",
@@ -306,6 +307,13 @@
    "label": "Let ERPNext Overwrite Shopify Titles and Descriptions",
    "default": "0",
    "description": "Off by default, and think hard before turning it on. Shopify holds your storefront copy -- the title a customer reads, the description someone wrote for the product page. With this on, any edit to the Item in ERPNext replaces both with ERPNext's plain values, including an edit to something unrelated like a weight."
+  },
+  {
+   "fieldname": "create_suppliers_from_vendor",
+   "fieldtype": "Check",
+   "label": "Create Suppliers from a Product's Shopify Vendor",
+   "default": "0",
+   "description": "Off by default, and leave it off unless you really do use Shopify's Vendor field to record who you buy from. Shopify fills Vendor with your own shop's name unless someone sets it, so turning this on against a normal catalogue creates a Supplier named after your shop and attaches it to every product. Items published from ERPNext are never given a supplier this way whatever this is set to -- their Vendor came from us in the first place."
   },
   {
    "fieldname": "column_break_outbound",
