@@ -46,13 +46,28 @@ UNIQUE_CONSTRAINTS = [
 #:
 #: Custom fields rather than a separate link doctype: a user looking at a Sales Order needs to
 #: see which Shopify order it came from.
+#: Stands in for "work it out from the doctype at install time".
+#:
+#: A Section Break does not merely add a section: Frappe moves every field after it, up to
+#: the next section, inside the new one. Anchoring ours mid-section therefore hid a good part
+#: of three forms -- Sales Order's transaction_date, delivery_date, company and pos_profile,
+#: Sales Invoice's return_against, is_debit_note and update flags, Delivery Note's
+#: return_against and issue_credit_note -- inside a collapsed "Shopify" section nobody would
+#: think to open.
+END_OF_FORM = "__end_of_form__"
+
+#: Fieldtypes that close a section. A field followed by one of these already ends its
+#: section, so a Section Break placed after it absorbs nothing.
+SECTION_ENDERS = ("Section Break", "Tab Break")
+
+
 CUSTOM_FIELDS = {
 	"Sales Order": [
 		{
 			"fieldname": "shopify_section",
 			"fieldtype": "Section Break",
 			"label": "Shopify",
-			"insert_after": "order_type",
+			"insert_after": END_OF_FORM,
 			"collapsible": 1,
 		},
 		{
@@ -85,7 +100,7 @@ CUSTOM_FIELDS = {
 			"fieldname": "shopify_section",
 			"fieldtype": "Section Break",
 			"label": "Shopify",
-			"insert_after": "is_return",
+			"insert_after": END_OF_FORM,
 			"collapsible": 1,
 		},
 		{
@@ -118,7 +133,7 @@ CUSTOM_FIELDS = {
 			"fieldname": "shopify_section",
 			"fieldtype": "Section Break",
 			"label": "Shopify",
-			"insert_after": "is_return",
+			"insert_after": END_OF_FORM,
 			"collapsible": 1,
 		},
 		{
@@ -173,15 +188,59 @@ CUSTOM_FIELDS = {
 }
 
 
+def end_of_form_anchor(doctype: str) -> str | None:
+	"""A field the Shopify section can follow without swallowing the rest of the form.
+
+	The only safe anchor is a field that already ends its section -- one whose next field is
+	a Section Break or a Tab Break, or which is last. The *last* such field puts the section
+	at the end of the form, which is where a read-only integration panel belongs.
+
+	Worked out from the live meta rather than hard-coded, because which field that is differs
+	by ERPNext version and by whatever else is installed. Our own fields are ignored, so the
+	answer does not drift every time this runs.
+	"""
+	ours = {field["fieldname"] for field in CUSTOM_FIELDS.get(doctype, [])}
+	fields = [field for field in frappe.get_meta(doctype).fields if field.fieldname not in ours]
+
+	anchor = None
+	for index, field in enumerate(fields):
+		if field.fieldtype in (*SECTION_ENDERS, "Column Break"):
+			continue
+		following = fields[index + 1] if index + 1 < len(fields) else None
+		if following is None or following.fieldtype in SECTION_ENDERS:
+			anchor = field.fieldname
+	return anchor
+
+
+def _resolved(doctype: str, field: dict) -> dict:
+	"""One field definition with its placeholder anchor filled in."""
+	# Stamped with the module so they are identifiable as ours in the Custom Field list.
+	field = dict(field, module="Shopify Integration")
+	if field.get("insert_after") != END_OF_FORM:
+		return field
+
+	anchor = end_of_form_anchor(doctype)
+	if anchor:
+		field["insert_after"] = anchor
+	else:
+		# Nothing to anchor on. Frappe appends, which is the same place we were aiming for.
+		field.pop("insert_after", None)
+	return field
+
+
 def ensure_custom_fields():
+	"""Create the app's custom fields, and move them if they are in the wrong place.
+
+	Runs after every migrate, and `create_custom_fields` updates what it finds, so a site
+	installed while the Shopify section sat mid-form has it moved to the end on the next
+	migrate without anyone doing anything.
+	"""
 	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
-	# Stamped with the module so they are identifiable as ours in the Custom Field list.
-	tagged = {
-		doctype: [dict(field, module="Shopify Integration") for field in fields]
-		for doctype, fields in CUSTOM_FIELDS.items()
+	resolved = {
+		doctype: [_resolved(doctype, field) for field in fields] for doctype, fields in CUSTOM_FIELDS.items()
 	}
-	create_custom_fields(tagged, ignore_validate=True)
+	create_custom_fields(resolved, ignore_validate=True)
 
 
 def after_install():
