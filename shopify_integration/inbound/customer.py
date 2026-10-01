@@ -21,10 +21,16 @@ from frappe.utils import cstr
 from shopify_integration.catalogue.echo import inbound_write, mark
 from shopify_integration.inbound.webhook import payload_of
 
-#: An identifier on more than this many customers is a placeholder, not a person -- a shop's
-#: own landline, the 9999999999 typed past a required field, or info@ on a company account.
-#: Matching on one would merge every online shopper onto a single record, far worse than a
-#: duplicate, so past this count we decline to match at all.
+#: An identifier on more than this many *active* customers is a placeholder, not a person --
+#: a shop's own landline, the 9999999999 typed past a required field, or info@ on a company
+#: account. Matching on one would merge every online shopper onto a single record, far worse
+#: than a duplicate, so past this count we decline to match at all.
+#:
+#: Disabled customers are excluded from the count and from the candidates. They were not, and
+#: since claiming an account disables the empty duplicate it left behind, this app was
+#: manufacturing the very records that pushed a real number over the threshold: 8459867853 sat
+#: on four customers of which two were disabled, so a genuine shopper was read as a
+#: placeholder and given a fifth record.
 MAX_CUSTOMERS_PER_IDENTIFIER = 3
 
 
@@ -113,6 +119,9 @@ def find_customer_by_mobile(number: str) -> str | None:
 		  ON link.parent = phone.parent
 		 AND link.parenttype = 'Contact'
 		 AND link.link_doctype = 'Customer'
+		JOIN `tabCustomer` customer
+		  ON customer.name = link.link_name
+		 AND IFNULL(customer.disabled, 0) = 0
 		WHERE RIGHT(REGEXP_REPLACE(phone.phone, '[^0-9]', ''), 10) = %(number)s
 
 		UNION
@@ -120,6 +129,7 @@ def find_customer_by_mobile(number: str) -> str | None:
 		SELECT name AS customer
 		FROM `tabCustomer`
 		WHERE RIGHT(REGEXP_REPLACE(IFNULL(mobile_no, ''), '[^0-9]', ''), 10) = %(number)s
+		  AND IFNULL(disabled, 0) = 0
 		""",
 		{"number": number},
 		as_dict=True,
@@ -146,6 +156,9 @@ def find_customer_by_email(email: str) -> str | None:
 		  ON link.parent = mail.parent
 		 AND link.parenttype = 'Contact'
 		 AND link.link_doctype = 'Customer'
+		JOIN `tabCustomer` customer
+		  ON customer.name = link.link_name
+		 AND IFNULL(customer.disabled, 0) = 0
 		WHERE LOWER(TRIM(mail.email_id)) = %(email)s
 
 		UNION
@@ -153,6 +166,7 @@ def find_customer_by_email(email: str) -> str | None:
 		SELECT name AS customer
 		FROM `tabCustomer`
 		WHERE LOWER(TRIM(IFNULL(email_id, ''))) = %(email)s
+		  AND IFNULL(disabled, 0) = 0
 		""",
 		{"email": email},
 		as_dict=True,

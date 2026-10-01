@@ -247,3 +247,75 @@ class TestEnrichingACustomerWithNoPrimaryContact(_CustomerCase):
 		):
 			self.made.append(("Contact", name))
 		self.assertEqual(find_customer_by_mobile("9800023333"), customer)
+
+
+class TestDisabledCustomersAreNotCounted(_CustomerCase):
+	"""A disabled record is not a person the shop can sell to.
+
+	Counting them toward the placeholder threshold was self-inflicted: claiming an account
+	disables the empty duplicate it leaves behind, so this app manufactured the very records
+	that pushed a real number over the limit. On the live site 8459867853 sat on four
+	customers, two of them disabled, so a genuine shopper was read as a placeholder and given
+	a fifth record.
+	"""
+
+	NUMBER = "8459867853"
+	EMAIL = "disabled-probe@example.com"
+
+	def disabled_customer(self, label, phone=None, email=None):
+		name = self.customer(label, phone=phone, email=email)
+		frappe.db.set_value("Customer", name, "disabled", 1, update_modified=False)
+		frappe.db.commit()
+		return name
+
+	def test_two_active_and_two_disabled_matches_the_oldest_active(self):
+		"""The live case. Four records, but only two of them are real."""
+		oldest = self.customer("Active First", phone=self.NUMBER)
+		self.customer("Active Second", phone=self.NUMBER)
+		self.disabled_customer("Dead One", phone=self.NUMBER)
+		self.disabled_customer("Dead Two", phone=self.NUMBER)
+
+		self.assertEqual(find_customer_by_mobile(self.NUMBER), oldest)
+
+	def test_four_active_is_still_a_placeholder(self):
+		"""The threshold itself is unchanged -- only what counts toward it."""
+		for index in range(4):
+			self.customer(f"Active {index}", phone=self.NUMBER)
+
+		self.assertIsNone(find_customer_by_mobile(self.NUMBER))
+
+	def test_a_number_only_on_disabled_customers_matches_nobody(self):
+		"""Nothing to attach an order to, so a new customer is the right answer."""
+		self.disabled_customer("Dead One", phone=self.NUMBER)
+		self.disabled_customer("Dead Two", phone=self.NUMBER)
+
+		self.assertIsNone(find_customer_by_mobile(self.NUMBER))
+
+	def test_a_disabled_customer_is_never_returned_as_the_match(self):
+		"""Even alone, and even though it is the oldest."""
+		self.disabled_customer("Dead Alone", phone=self.NUMBER)
+		active = self.customer("Active Later", phone=self.NUMBER)
+
+		self.assertEqual(find_customer_by_mobile(self.NUMBER), active)
+
+	def test_the_same_holds_for_email(self):
+		oldest = self.customer("Mail Active First", email=self.EMAIL)
+		self.customer("Mail Active Second", email=self.EMAIL)
+		self.disabled_customer("Mail Dead One", email=self.EMAIL)
+		self.disabled_customer("Mail Dead Two", email=self.EMAIL)
+
+		self.assertEqual(find_customer_by_email(self.EMAIL), oldest)
+
+	def test_an_email_only_on_disabled_customers_matches_nobody(self):
+		self.disabled_customer("Mail Dead One", email=self.EMAIL)
+		self.assertIsNone(find_customer_by_email(self.EMAIL))
+
+	def test_a_disabled_customer_found_through_Customer_mobile_no_is_excluded(self):
+		"""The other half of the union: the field on the Customer itself, not the contact."""
+		name = self.customer("Direct Field")
+		frappe.db.set_value(
+			"Customer", name, {"mobile_no": self.NUMBER, "disabled": 1}, update_modified=False
+		)
+		frappe.db.commit()
+
+		self.assertIsNone(find_customer_by_mobile(self.NUMBER))
