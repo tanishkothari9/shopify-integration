@@ -1,13 +1,33 @@
-# What images a product already has, so the same one is not attached twice.
+# Everything the app needs to know about a product's images in one call.
+#
+# `originalSource.url` is what Shopify fetched the image from, which is how media created
+# before this app recorded its own can still be matched to an ERPNext file. `status` and
+# `mediaErrors` are here because Shopify processes media asynchronously: a mutation that
+# returned no errors can still leave a FAILED image on the product minutes later, and
+# without this the product quietly shows nothing where a photograph should be.
+#
+# 250 is Shopify's own ceiling on media per product, so one page is always the whole list.
 query ProductMedia($id: ID!) {
   product(id: $id) {
     id
-    media(first: 20) {
+    media(first: 250) {
       nodes {
         ... on MediaImage {
           id
-          image {
-            url
+          status
+          alt
+          image { url }
+          originalSource { url }
+          mediaErrors { code details message }
+        }
+      }
+    }
+    variants(first: 100) {
+      nodes {
+        id
+        media(first: 250) {
+          nodes {
+            ... on MediaImage { id }
           }
         }
       }

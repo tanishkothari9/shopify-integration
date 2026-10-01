@@ -52,6 +52,9 @@ doc_events: dict = {
 		],
 		"on_update": [
 			"shopify_integration.outbound.product.on_item_change",
+			# Its photographs, when the Image field moves. Attachments come through the File
+			# events below instead -- saving the Item is not what adds one.
+			"shopify_integration.outbound.media.on_item_change",
 			# The Item carries a price too -- Standard Selling Rate is where ERPNext puts a
 			# rate typed on the form. Without this it was readable and never sent.
 			"shopify_integration.outbound.price.on_item_change",
@@ -59,6 +62,14 @@ doc_events: dict = {
 			# decides which Shopify collection carries the right override.
 			"shopify_integration.outbound.collections.on_item_change",
 		],
+	},
+	# Staff keep a product's other photographs as attachments on the Item. Adding or
+	# removing one is a File event and nothing else: the Item is never saved for it, so
+	# without these the extra images would reach Shopify only if something else happened to
+	# touch the item.
+	"File": {
+		"after_insert": "shopify_integration.outbound.media.on_file_change",
+		"on_trash": "shopify_integration.outbound.media.on_file_change",
 	},
 	# A group's tax rules move every published item under it, which is why this is queued
 	# per item rather than done in the save.

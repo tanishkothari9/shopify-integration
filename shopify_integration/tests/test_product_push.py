@@ -16,6 +16,7 @@ from unittest.mock import patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from shopify_integration.outbound import media as media_module
 from shopify_integration.outbound import product as product_module
 from shopify_integration.tests.test_handlers import FakeClient
 from shopify_integration.tests.test_integration import SECRET_A, make_store, with_hsn
@@ -138,7 +139,7 @@ class TestItemImageReachesShopify(FrappeTestCase):
 		self.assertIsNone(product_module.item_image_url(self._item(None)))
 
 	def test_a_site_path_becomes_absolute(self):
-		with patch.object(product_module, "get_url", return_value="https://shop.example.com"):
+		with patch.object(media_module, "get_url", return_value="https://shop.example.com"):
 			self.assertEqual(
 				product_module.item_image_url(self._item("/files/saree.png")),
 				"https://shop.example.com/files/saree.png",
@@ -146,7 +147,7 @@ class TestItemImageReachesShopify(FrappeTestCase):
 
 	def test_spaces_and_commas_in_the_filename_are_encoded(self):
 		"""Real uploads are called things like 'ChatGPT Image Aug 24, 2026, 07_38_56 PM.png'."""
-		with patch.object(product_module, "get_url", return_value="https://shop.example.com"):
+		with patch.object(media_module, "get_url", return_value="https://shop.example.com"):
 			url = product_module.item_image_url(self._item("/files/A B, C.png"))
 		self.assertNotIn(" ", url)
 		self.assertTrue(url.startswith("https://shop.example.com/files/"))
@@ -154,7 +155,7 @@ class TestItemImageReachesShopify(FrappeTestCase):
 	def test_a_localhost_site_sends_nothing(self):
 		"""Shopify cannot fetch from a developer's laptop, and a broken image is worse than none."""
 		for base in ("http://localhost:8000", "http://127.0.0.1:8080", "http://mysite.localhost"):
-			with patch.object(product_module, "get_url", return_value=base):
+			with patch.object(media_module, "get_url", return_value=base):
 				self.assertIsNone(
 					product_module.item_image_url(self._item("/files/saree.png")),
 					f"{base} was treated as publicly reachable",
@@ -163,7 +164,7 @@ class TestItemImageReachesShopify(FrappeTestCase):
 	def test_a_private_file_sends_nothing(self):
 		"""Frappe serves private files only to a logged-in session; Shopify has none."""
 		with (
-			patch.object(product_module, "get_url", return_value="https://shop.example.com"),
+			patch.object(media_module, "get_url", return_value="https://shop.example.com"),
 			patch.object(frappe.db, "exists", return_value=True),
 		):
 			self.assertIsNone(product_module.item_image_url(self._item("/private/files/x.png")))

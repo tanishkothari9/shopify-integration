@@ -22,8 +22,7 @@
   "column_break_3",
   "price_synced_on",
   "online_store_publish_done",
-  "app_media_gids",
-  "image_synced_url"
+  "app_media"
  ],
  "fields": [
   {
@@ -127,18 +126,12 @@
    "description": "Set once the app has made its one and only decision about putting this product on the Online Store. Whether it ends up published after that is the merchant's to change; the app never revisits it, and never reads Shopify about it again."
   },
   {
-   "fieldname": "app_media_gids",
-   "fieldtype": "Small Text",
-   "label": "Media Created by This App",
+   "fieldname": "app_media",
+   "fieldtype": "Code",
+   "options": "JSON",
+   "label": "App Media",
    "read_only": 1,
-   "description": "Shopify media ids this app attached, one per line. Only these are ever removed when the ERPNext image changes -- photography the merchant added is never touched."
-  },
-  {
-   "fieldname": "image_synced_url",
-   "fieldtype": "Data",
-   "label": "Image Last Sent",
-   "read_only": 1,
-   "description": "The ERPNext image URL last pushed, so an unchanged image costs nothing."
+   "description": "Which Shopify media this app created, as {file_url: media id}. It is the only thing that distinguishes an image the app uploaded from photography the merchant added in the Shopify admin, which is never moved or deleted."
   }
  ],
  "index_web_pages_for_search": 1,

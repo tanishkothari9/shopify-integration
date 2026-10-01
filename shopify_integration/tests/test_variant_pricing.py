@@ -119,7 +119,6 @@ class TestTheStatusThatReachesShopify(FrappeTestCase):
 			patch.object(product_module, "_options_from", return_value=[]),
 			patch.object(product_module, "_create_variants"),
 			patch.object(product_module, "_fill_variant"),
-			patch.object(product_module, "_sync_image"),
 			patch.object(product_module, "_reread", return_value={"id": "gid://shopify/Product/1"}),
 			patch.object(product_module, "_link_variants"),
 			patch.object(product_module, "_link"),

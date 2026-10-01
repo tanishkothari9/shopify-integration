@@ -1,19 +1,20 @@
-# Attach an image to a product. Shopify fetches `originalSource` itself, so the URL has to be
+# Attach images to a product. Shopify fetches `originalSource` itself, so the URL has to be
 # publicly reachable -- a localhost site cannot use this, and neither can a private file.
+#
+# `status` comes back UPLOADED or PROCESSING, never READY: the processing is asynchronous, so
+# an image Shopify cannot decode fails after this call returns. `mediaErrors` is read on the
+# next sync for that reason.
 mutation ProductCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
   productCreateMedia(productId: $productId, media: $media) {
     media {
       ... on MediaImage {
         id
         status
-        image {
-          url
-        }
+        image { url }
+        originalSource { url }
+        mediaErrors { code details message }
       }
     }
-    mediaUserErrors {
-      field
-      message
-    }
+    mediaUserErrors { code field message }
   }
 }

@@ -1,0 +1,15 @@
+# Put ERPNext's main image first.
+#
+# Only the featured position is ever moved. Reshuffling the rest would displace photography
+# the merchant arranged in the Shopify admin, and the order the app's own images are created
+# in is already ERPNext's order -- so a move is needed exactly when the Item's Image field
+# changes to a picture that is already on the product.
+#
+# Asynchronous: the payload is a Job, not the product. The new order is not visible to the
+# very next read, which is why nothing here waits on it.
+mutation productReorderMedia($id: ID!, $moves: [MoveInput!]!) {
+  productReorderMedia(id: $id, moves: $moves) {
+    job { id done }
+    mediaUserErrors { code field message }
+  }
+}

@@ -19,13 +19,12 @@ inbound writer did not mark its saves.
 
 from __future__ import annotations
 
-from urllib.parse import quote, urlparse
-
 import frappe
-from frappe.utils import cstr, get_url
+from frappe.utils import cstr
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import is_echo
+from shopify_integration.outbound.media import enqueue_media
 from shopify_integration.shopify_integration.doctype.shopify_item_link.shopify_item_link import (
 	linked_stores,
 )
@@ -209,7 +208,7 @@ def push_products(store: str, rows: list[dict]) -> None:
 				publish_to_online_store(client, store, link.product_gid)
 			_mark_publish_decided(store, link.product_gid)
 
-		_sync_image(client, link.product_gid, item, store)
+		enqueue_media(store, item_code)
 
 
 # --------------------------------------------------------------------------------------
@@ -384,8 +383,6 @@ def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) 
 		if variants:
 			_fill_variant(client, product["id"], variants[0]["id"], item, store_doc)
 
-	_sync_image(client, product["id"], item, store)
-
 	# Re-read: SKUs, prices and inventory items only exist after the second call, and a link
 	# without the inventory item id cannot push stock.
 	product = _reread(client, product["id"]) or product
@@ -430,141 +427,15 @@ def _fill_variant(client: ShopifyClient, product_gid: str, variant_gid: str, ite
 
 
 def item_image_url(item) -> str | None:
-	"""An absolute, publicly fetchable URL for the item's image, or None.
+	"""An absolute, publicly fetchable URL for the item's Image field, or None.
 
-	Shopify fetches the image itself rather than accepting an upload here, so the URL has to be
-	reachable from the internet. Three things make that fail, and each is worth saying out loud
-	rather than failing silently:
-
-	* the Item has no image at all;
-	* the file is private -- Frappe serves those only to a logged-in session, so Shopify gets
-	  a redirect to the login page and stores that as the product photo;
-	* the site is only on localhost, so there is nothing for Shopify to fetch.
+	The single-image question the product payload still asks. Which files are public and
+	how they are addressed is `outbound.media`'s to answer, because it has to answer it
+	for attachments too.
 	"""
-	image = cstr(item.get("image")).strip()
-	if not image:
-		return None
+	from shopify_integration.outbound.media import public_url
 
-	if image.startswith(("http://", "https://")):
-		return image
-
-	if frappe.db.exists("File", {"file_url": image, "is_private": 1}):
-		frappe.logger("shopify_integration").info(
-			f"Not sending {item.name}'s image to Shopify: {image} is a private file, and "
-			f"Shopify has no session to fetch it with. Re-upload it unticked as private."
-		)
-		return None
-
-	base = cstr(get_url()).rstrip("/")
-	host = urlparse(base).hostname or ""
-	if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost"):
-		frappe.logger("shopify_integration").info(
-			f"Not sending {item.name}'s image to Shopify: this site is {base}, which Shopify "
-			f"cannot reach. Set host_name in site_config to a public URL."
-		)
-		return None
-
-	# The path is already URL-ish but filenames routinely carry spaces and commas.
-	return base + quote(image, safe="/:@&=+$,-_.!~*'()")
-
-
-def _sync_image(client: ShopifyClient, product_gid: str, item, store: str | None = None) -> None:
-	"""Keep the Shopify product's featured image in step with the Item's.
-
-	The first version attached the image only when the product had none at all, to avoid
-	trampling the merchant's photography. That was the right instinct and the wrong rule: it
-	meant an image changed in ERPNext never reached Shopify again, because by then the
-	product had media -- its own.
-
-	So the app now remembers which media it put there, on the link. Changing the image adds
-	the new one as featured and deletes **only the recorded ones**; anything the merchant
-	uploaded is left exactly where they put it, in the order they arranged it.
-	"""
-	store = store or _store_of(product_gid)
-	if store and not frappe.db.get_value("Shopify Store", store, "sync_item_images"):
-		return
-
-	url = item_image_url(item)
-	if not url:
-		return
-
-	link = _link_row(store, item.name) if store else None
-	if link and cstr(link.get("image_synced_url")) == url:
-		# Nothing has changed, and asking Shopify would cost a call to learn that.
-		return
-
-	ours = _recorded_media(link)
-	existing = _product_media(client, product_gid)
-
-	if existing and not ours:
-		# Media we did not put there, from before this app recorded what it owned. The
-		# merchant's until proven otherwise, so it is left alone and so is the product.
-		if link:
-			frappe.db.set_value(
-				"Shopify Item Link", link["name"], "image_synced_url", url, update_modified=False
-			)
-		return
-
-	created = _attach_image(client, product_gid, item, url)
-	if not created:
-		return
-
-	stale = [media for media in ours if media in existing and media not in created]
-	if stale:
-		client.execute(
-			load_query("product_delete_media"),
-			{"productId": product_gid, "mediaIds": stale},
-			cost_hint=10,
-		)
-
-	if link:
-		frappe.db.set_value(
-			"Shopify Item Link",
-			link["name"],
-			{"app_media_gids": "\n".join(created), "image_synced_url": url},
-			update_modified=False,
-		)
-
-
-def _store_of(product_gid: str) -> str | None:
-	return frappe.db.get_value("Shopify Item Link", {"product_gid": product_gid}, "store")
-
-
-def _link_row(store: str, item_code: str) -> dict | None:
-	link = product_link_for(store, item_code)
-	if not link:
-		return None
-	return frappe.db.get_value(
-		"Shopify Item Link", link.name, ["name", "app_media_gids", "image_synced_url"], as_dict=True
-	)
-
-
-def _recorded_media(link: dict | None) -> list[str]:
-	"""The media ids this app put on the product, as recorded on the link."""
-	if not link:
-		return []
-	return [line.strip() for line in cstr(link.get("app_media_gids")).splitlines() if line.strip()]
-
-
-def _product_media(client: ShopifyClient, product_gid: str) -> list[str]:
-	data = client.execute(load_query("product_media"), {"id": product_gid}, cost_hint=5)
-	nodes = ((data.get("product") or {}).get("media") or {}).get("nodes") or []
-	return [cstr(node.get("id")) for node in nodes if node.get("id")]
-
-
-def _attach_image(client: ShopifyClient, product_gid: str, item, url: str) -> list[str]:
-	"""Add the image and report the media ids Shopify made, or nothing if it refused."""
-	result = client.execute(
-		load_query("product_create_media"),
-		{"productId": product_gid, "media": [{"originalSource": url, "mediaContentType": "IMAGE"}]},
-		cost_hint=10,
-	)
-	payload = result.get("productCreateMedia") or {}
-	errors = payload.get("mediaUserErrors") or []
-	if errors:
-		frappe.logger("shopify_integration").warning(f"Shopify refused {item.name}'s image ({url}): {errors}")
-		return []
-	return [cstr(media.get("id")) for media in (payload.get("media") or []) if media.get("id")]
+	return public_url(cstr(item.get("image")), cstr(item.name))
 
 
 def _sellable_variants(children: list[dict], store_doc) -> tuple[list[dict], list[str], bool]:
@@ -749,6 +620,17 @@ def push_initial_state(store: str, item_code: str) -> None:
 		push_initial_stock(store, item_code)
 	if not link.price_synced_on and _erpnext_holds_a_price(store, item_code):
 		push_initial_price(store, item_code)
+	# And its photographs. Guarded like the rest: an Item created *by* a catalogue import
+	# has no images at all, and asking Shopify what media each of 87,000 products has in
+	# order to discover that is a cost with nothing at the end of it.
+	if _erpnext_holds_images(item_code):
+		enqueue_media(store, item_code)
+
+
+def _erpnext_holds_images(item_code: str) -> bool:
+	from shopify_integration.outbound.media import desired_files
+
+	return bool(desired_files(item_code))
 
 
 def _erpnext_holds_stock(store: str, item_code: str) -> bool:

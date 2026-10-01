@@ -1,0 +1,11 @@
+# Attach media already on the product to one of its variants, so the storefront shows the
+# right photograph when a shopper picks a size or a colour.
+#
+# Append, not replace: the media must exist on the product first, which is why a variant's
+# own image is uploaded to the product before this is called.
+mutation productVariantAppendMedia($productId: ID!, $variantMedia: [ProductVariantAppendMediaInput!]!) {
+  productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+    productVariants { id }
+    userErrors { code field message }
+  }
+}

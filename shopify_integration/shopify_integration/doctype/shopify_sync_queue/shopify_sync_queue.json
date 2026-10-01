@@ -38,7 +38,7 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Operation",
-   "options": "inventory\nproduct\nprice\nfulfillment\ncollection",
+   "options": "inventory\nproduct\nprice\nfulfillment\ncollection\nmedia",
    "reqd": 1
   },
   {
