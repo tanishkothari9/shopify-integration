@@ -51,6 +51,44 @@ def on_product_delete(event_log: str):
 		raise
 
 
+#: How many times to re-read and try again when somebody else saved the Item mid-write.
+WRITE_ATTEMPTS = 4
+
+
+def _write_with_retry(store: str, product: dict) -> dict:
+	"""Map the product, re-reading and retrying if the Item moved underneath us.
+
+	Publishing an item from ERPNext makes Shopify fire products/create and products/update
+	straight back, and those land while the outbound job is still saving the same Item. Both
+	sides are writing the row they each read a moment ago, and the loser gets
+	"Document has been modified after you have opened it" -- which is a race, not a fault, and
+	was being logged as an Error on a product that was perfectly fine. Two of them inside
+	forty-three seconds on the live store.
+
+	Re-reading is the whole fix: the next attempt maps onto the Item as it now is, which is
+	what it should have been doing. Backed off a little so two workers do not simply collide
+	again at the same instant, and allowed to fail in the end, because a mismatch that
+	survives four attempts is something else wearing this error's clothes.
+	"""
+	import random
+	import time
+
+	for attempt in range(1, WRITE_ATTEMPTS + 1):
+		try:
+			with inbound_write():
+				return write_product_mapping(store, product)
+		except frappe.TimestampMismatchError:
+			if attempt == WRITE_ATTEMPTS:
+				raise
+			frappe.db.rollback()
+			frappe.logger("shopify_integration").info(
+				f"{product.get('id')}: the Item was saved while this webhook was writing it; "
+				f"re-reading and trying again ({attempt} of {WRITE_ATTEMPTS - 1})"
+			)
+			time.sleep(0.2 * attempt + random.random() * 0.2)
+	raise frappe.TimestampMismatchError
+
+
 def _upsert_from_webhook(event_log: str):
 	"""Refetch the product over GraphQL, then map it.
 
@@ -91,8 +129,7 @@ def _upsert_from_webhook(event_log: str):
 
 		product["variants"] = [edge["node"] for edge in (variants.get("edges") or [])]
 
-		with inbound_write():
-			result = write_product_mapping(log.store, product)
+		result = _write_with_retry(log.store, product)
 		frappe.db.commit()
 
 		# A warning here means the item was updated but one part of it could not be: a variant

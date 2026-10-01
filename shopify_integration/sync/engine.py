@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import random
 import re
+from contextlib import contextmanager
 from datetime import timedelta
 
 import frappe
-from frappe.utils import now_datetime
+from frappe.utils import get_site_path, now_datetime
 from frappe.utils.file_lock import LockTimeoutError
-from frappe.utils.synchronization import filelock
 
 #: Rows claimed per drain pass. Bounded so one store's backlog cannot monopolise a worker.
 DEFAULT_BATCH_SIZE = 50
@@ -117,12 +117,48 @@ def drain_store(store: str, batch_size: int = DEFAULT_BATCH_SIZE) -> dict:
 	concurrent drain of one store could not have gone faster even if it had worked.
 	"""
 	try:
-		with filelock(_lock_name(store), timeout=1):
-			return _drain_locked(store, batch_size)
+		with quiet_filelock(_lock_name(store), timeout=1):
+			result = _drain_locked(store, batch_size)
 	except LockTimeoutError:
-		# Another worker has this store. It will pick up whatever we would have claimed, and a
-		# fresh drain is scheduled by whatever wrote the next row.
+		# Another worker has this store. It will pick up whatever we would have claimed, and
+		# it schedules a fresh drain itself if anything is still due when it finishes.
 		return {"claimed": 0, "done": 0, "failed": 0, "requeued": 0, "skipped": "already draining"}
+
+	# More work waiting: come back for it rather than draining unboundedly in one job.
+	#
+	# Scheduled *after* the lock is released, and only once this job's work is done. Asking
+	# from inside the drain -- which is where it used to be -- deduplicates the new job
+	# against the one currently executing, so the signal is swallowed and the row waits for
+	# the safety net. That is how an inventory push sat Pending from 21:47 until 22:00:
+	# correct in the end, thirteen minutes late.
+	if has_pending(store):
+		schedule_drain(store)
+
+	return result
+
+
+@contextmanager
+def quiet_filelock(lock_name: str, *, timeout: int = 1):
+	"""Frappe's filelock, without an Error Log every time somebody loses the race.
+
+	`frappe.utils.synchronization.filelock` calls `frappe.log_error` before it re-raises, so
+	catching LockTimeoutError does not stop the entry being written. A second worker finding
+	a store already draining is the design working, not a fault, and on a busy shop it filled
+	the Error Log with hundreds of them a day -- which is how the errors that matter get
+	missed.
+
+	Same lock file and same semantics, so it interlocks with anything still using Frappe's.
+	"""
+	import os
+
+	from filelock import FileLock, Timeout
+
+	path = os.path.abspath(get_site_path("locks", lock_name + ".lock"))
+	try:
+		with FileLock(path, timeout=timeout):
+			yield
+	except Timeout as exc:
+		raise LockTimeoutError(f"Failed to acquire lock: {lock_name}") from exc
 
 
 def _lock_name(store: str) -> str:
@@ -163,11 +199,6 @@ def _drain_locked(store: str, batch_size: int) -> dict:
 			result["done"] += 1
 
 	frappe.db.commit()
-
-	if has_pending(store):
-		# More work waiting: come back for it rather than draining unboundedly in one job.
-		schedule_drain(store)
-
 	return result
 
 

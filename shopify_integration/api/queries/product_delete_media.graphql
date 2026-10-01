@@ -1,0 +1,8 @@
+# Remove media from a product. Only ever called with ids this app recorded as its own, so a
+# photograph the merchant uploaded is never among them.
+mutation productDeleteMedia($productId: ID!, $mediaIds: [ID!]!) {
+  productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
+    deletedMediaIds
+    mediaUserErrors { field message }
+  }
+}

@@ -16,8 +16,11 @@ scheduler_events = {
 	"cron": {
 		# Return rows orphaned by a killed worker to Pending (spec §7.2).
 		"*/10 * * * *": ["shopify_integration.sync.engine.recover_stale_running"],
-		# Nudge any store with pending rows, in case an enqueued drain was lost.
-		"*/15 * * * *": ["shopify_integration.sync.engine.drain_all_stores"],
+		# Nudge any store with pending rows, in case an enqueued drain was lost. Every minute
+		# rather than every fifteen: a drain now reschedules itself while work remains, so this
+		# is a true safety net, and the longest a dropped signal can strand a push is how long
+		# a customer waits to see stock they can buy.
+		"* * * * *": ["shopify_integration.sync.engine.drain_all_stores"],
 		# Re-poll bulk operations whose poll job was lost, so an import cannot stall at
 		# Running forever with its results never applied.
 		"*/5 * * * *": ["shopify_integration.api.bulk.poll_running_operations"],

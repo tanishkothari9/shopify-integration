@@ -46,6 +46,7 @@
   "section_outbound",
   "sync_inventory",
   "sync_items",
+  "sync_item_images",
   "sync_item_titles",
   "create_suppliers_from_vendor",
   "column_break_outbound",
@@ -302,6 +303,13 @@
    "fieldtype": "Check",
    "label": "Sync Items",
    "default": "0"
+  },
+  {
+   "fieldname": "sync_item_images",
+   "fieldtype": "Check",
+   "label": "Sync Item Image from ERPNext",
+   "default": "1",
+   "description": "Keep the Shopify product's featured image in step with the Item's. Only images this app put there are ever replaced -- photography the merchant added in Shopify stays, and stays in the order they arranged it. Turn this off if the storefront images are managed entirely in Shopify."
   },
   {
    "fieldname": "sync_item_titles",

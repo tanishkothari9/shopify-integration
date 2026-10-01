@@ -209,7 +209,7 @@ def push_products(store: str, rows: list[dict]) -> None:
 				publish_to_online_store(client, store, link.product_gid)
 			_mark_publish_decided(store, link.product_gid)
 
-		_sync_image(client, link.product_gid, item)
+		_sync_image(client, link.product_gid, item, store)
 
 
 # --------------------------------------------------------------------------------------
@@ -384,7 +384,7 @@ def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) 
 		if variants:
 			_fill_variant(client, product["id"], variants[0]["id"], item, store_doc)
 
-	_sync_image(client, product["id"], item)
+	_sync_image(client, product["id"], item, store)
 
 	# Re-read: SKUs, prices and inventory items only exist after the second call, and a link
 	# without the inventory item id cannot push stock.
@@ -468,29 +468,103 @@ def item_image_url(item) -> str | None:
 	return base + quote(image, safe="/:@&=+$,-_.!~*'()")
 
 
-def _sync_image(client: ShopifyClient, product_gid: str, item) -> None:
-	"""Attach the ERPNext item's image to the Shopify product, once.
+def _sync_image(client: ShopifyClient, product_gid: str, item, store: str | None = None) -> None:
+	"""Keep the Shopify product's featured image in step with the Item's.
 
-	Only when the product has no image yet. Shopify's media list is the merchant's -- they may
-	have added better photography there, and replacing it on every save would be the storefront
-	copy problem all over again.
+	The first version attached the image only when the product had none at all, to avoid
+	trampling the merchant's photography. That was the right instinct and the wrong rule: it
+	meant an image changed in ERPNext never reached Shopify again, because by then the
+	product had media -- its own.
+
+	So the app now remembers which media it put there, on the link. Changing the image adds
+	the new one as featured and deletes **only the recorded ones**; anything the merchant
+	uploaded is left exactly where they put it, in the order they arranged it.
 	"""
+	store = store or _store_of(product_gid)
+	if store and not frappe.db.get_value("Shopify Store", store, "sync_item_images"):
+		return
+
 	url = item_image_url(item)
 	if not url:
 		return
 
-	existing = client.execute(load_query("product_media"), {"id": product_gid}, cost_hint=5)
-	if ((existing.get("product") or {}).get("media") or {}).get("nodes"):
+	link = _link_row(store, item.name) if store else None
+	if link and cstr(link.get("image_synced_url")) == url:
+		# Nothing has changed, and asking Shopify would cost a call to learn that.
 		return
 
+	ours = _recorded_media(link)
+	existing = _product_media(client, product_gid)
+
+	if existing and not ours:
+		# Media we did not put there, from before this app recorded what it owned. The
+		# merchant's until proven otherwise, so it is left alone and so is the product.
+		if link:
+			frappe.db.set_value(
+				"Shopify Item Link", link["name"], "image_synced_url", url, update_modified=False
+			)
+		return
+
+	created = _attach_image(client, product_gid, item, url)
+	if not created:
+		return
+
+	stale = [media for media in ours if media in existing and media not in created]
+	if stale:
+		client.execute(
+			load_query("product_delete_media"),
+			{"productId": product_gid, "mediaIds": stale},
+			cost_hint=10,
+		)
+
+	if link:
+		frappe.db.set_value(
+			"Shopify Item Link",
+			link["name"],
+			{"app_media_gids": "\n".join(created), "image_synced_url": url},
+			update_modified=False,
+		)
+
+
+def _store_of(product_gid: str) -> str | None:
+	return frappe.db.get_value("Shopify Item Link", {"product_gid": product_gid}, "store")
+
+
+def _link_row(store: str, item_code: str) -> dict | None:
+	link = product_link_for(store, item_code)
+	if not link:
+		return None
+	return frappe.db.get_value(
+		"Shopify Item Link", link.name, ["name", "app_media_gids", "image_synced_url"], as_dict=True
+	)
+
+
+def _recorded_media(link: dict | None) -> list[str]:
+	"""The media ids this app put on the product, as recorded on the link."""
+	if not link:
+		return []
+	return [line.strip() for line in cstr(link.get("app_media_gids")).splitlines() if line.strip()]
+
+
+def _product_media(client: ShopifyClient, product_gid: str) -> list[str]:
+	data = client.execute(load_query("product_media"), {"id": product_gid}, cost_hint=5)
+	nodes = ((data.get("product") or {}).get("media") or {}).get("nodes") or []
+	return [cstr(node.get("id")) for node in nodes if node.get("id")]
+
+
+def _attach_image(client: ShopifyClient, product_gid: str, item, url: str) -> list[str]:
+	"""Add the image and report the media ids Shopify made, or nothing if it refused."""
 	result = client.execute(
 		load_query("product_create_media"),
 		{"productId": product_gid, "media": [{"originalSource": url, "mediaContentType": "IMAGE"}]},
 		cost_hint=10,
 	)
-	errors = (result.get("productCreateMedia") or {}).get("mediaUserErrors") or []
+	payload = result.get("productCreateMedia") or {}
+	errors = payload.get("mediaUserErrors") or []
 	if errors:
 		frappe.logger("shopify_integration").warning(f"Shopify refused {item.name}'s image ({url}): {errors}")
+		return []
+	return [cstr(media.get("id")) for media in (payload.get("media") or []) if media.get("id")]
 
 
 def _sellable_variants(children: list[dict], store_doc) -> tuple[list[dict], list[str], bool]:
@@ -632,6 +706,18 @@ def push_initial_stock(store: str, item_code: str) -> int:
 	return queued
 
 
+def push_initial_price(store: str, item_code: str) -> int:
+	"""Send the price ERPNext already holds, for the same reason as the stock.
+
+	Creating the variant carries the price Shopify was given at the time. A price typed
+	before the item was ever published, or changed while the product row waited in the
+	queue, is not in that figure.
+	"""
+	from shopify_integration.outbound.price import enqueue_price
+
+	return enqueue_price(store, item_code) or 0
+
+
 def _link(store: str, item_code: str, product: dict) -> None:
 	from shopify_integration.catalogue.mapping import upsert_link
 
@@ -641,6 +727,7 @@ def _link(store: str, item_code: str, product: dict) -> None:
 	if _publish_pending.pop(cstr(product.get("id")), False):
 		_mark_publish_decided(store, cstr(product.get("id")))
 	push_initial_stock(store, item_code)
+	push_initial_price(store, item_code)
 
 
 # --------------------------------------------------------------------------------------
@@ -768,6 +855,7 @@ def _link_variants(store: str, template: str, product: dict, children: list[dict
 			template_item=template,
 		)
 		push_initial_stock(store, child["item_code"])
+		push_initial_price(store, child["item_code"])
 
 	if _publish_pending.pop(cstr(product.get("id")), False):
 		_mark_publish_decided(store, cstr(product.get("id")))

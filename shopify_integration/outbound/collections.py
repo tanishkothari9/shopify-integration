@@ -28,6 +28,8 @@ product in would throw every other product out.
 
 from __future__ import annotations
 
+import json
+
 import frappe
 from frappe.utils import cstr, flt
 
@@ -306,9 +308,27 @@ def push_collections(store: str, rows: list[dict]) -> None:
 
 	client = ShopifyClient.for_store(store)
 	for row in rows:
-		item_code = (row.get("payload") or {}).get("item_code") or row.get("ref_docname")
+		item_code = _item_from(row)
 		if item_code:
 			sync_item_collections(client, store_doc, item_code)
+
+
+def _item_from(row: dict) -> str | None:
+	"""The item a queue row is about.
+
+	The payload comes back as the JSON string `frappe.as_json` wrote, not a dict -- reading
+	it as one raised `'str' object has no attribute 'get'` on every single collection row, so
+	the operation had never once succeeded.
+	"""
+	payload = row.get("payload")
+	if payload:
+		try:
+			data = json.loads(payload) if isinstance(payload, str) else payload
+			if isinstance(data, dict) and data.get("item_code"):
+				return cstr(data["item_code"])
+		except (ValueError, TypeError):
+			pass
+	return cstr(row.get("ref_docname")) or None
 
 
 def sync_item_collections(client: ShopifyClient, store_doc, item_code: str) -> dict:

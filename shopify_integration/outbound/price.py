@@ -49,6 +49,21 @@ def on_item_change(doc, method=None):
 		)
 
 
+def enqueue_price(store: str, item_code: str) -> str | None:
+	"""Queue a price push for one item on one store. Honours the store's own switch."""
+	store_doc = frappe.get_cached_doc("Shopify Store", store)
+	if not store_doc.sync_prices:
+		return None
+
+	return enqueue_sync(
+		store,
+		"price",
+		dedupe_key=f"price:{store}:{item_code}",
+		ref_doctype="Item",
+		ref_docname=item_code,
+	)
+
+
 def on_price_change(doc, method=None):
 	"""doc_event on Item Price. Computes a dedupe key and enqueues -- nothing else."""
 	if is_echo(doc):
