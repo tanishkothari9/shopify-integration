@@ -399,6 +399,12 @@ def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) 
 	else:
 		_link(store, item_code, product)
 
+	# Now that it is linked, put it in the collection whose tax override matches what ERPNext
+	# will book for it. A no-op on any store that has not filled the map in.
+	from shopify_integration.outbound.collections import enqueue_for_item as enqueue_collection
+
+	enqueue_collection(store, item_code)
+
 	frappe.logger("shopify_integration").info(
 		f"Published {item_code} to {store} as {product['id']}"
 		+ (f" with {len(children)} variants" if children else "")

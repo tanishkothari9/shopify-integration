@@ -1,0 +1,28 @@
+{
+ "actions": [],
+ "creation": "2026-10-01 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": ["item_tax_template", "collection_gid", "collection_title"],
+ "fields": [
+  {"fieldname": "item_tax_template", "fieldtype": "Link", "in_list_view": 1, "label": "Item Tax Template", "options": "Item Tax Template", "reqd": 1,
+   "description": "The template ERPNext would book for an item at its current selling price."},
+  {"fieldname": "collection_gid", "fieldtype": "Data", "in_list_view": 1, "label": "Collection GID", "reqd": 1,
+   "description": "gid://shopify/Collection/... -- a manual collection carrying the matching tax override."},
+  {"fieldname": "collection_title", "fieldtype": "Data", "in_list_view": 1, "label": "Collection", "read_only": 1,
+   "description": "Filled in from Shopify so the row is readable."}
+ ],
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-10-01 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Shopify Integration",
+ "name": "Shopify Tax Collection",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

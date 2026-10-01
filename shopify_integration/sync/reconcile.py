@@ -60,6 +60,7 @@ def reconcile_store(store: str) -> dict:
 		"started_on": str(started),
 		"inventory": reconcile_inventory(store_doc),
 		"orders": reconcile_orders(store_doc),
+		"collections": reconcile_collections(store_doc),
 	}
 
 	frappe.db.set_value(
@@ -70,7 +71,9 @@ def reconcile_store(store: str) -> dict:
 	)
 	frappe.db.commit()
 
-	corrections = result["inventory"]["corrected"] + result["orders"]["replayed"]
+	corrections = (
+		result["inventory"]["corrected"] + result["orders"]["replayed"] + result["collections"]["corrected"]
+	)
 	if corrections:
 		# Worth a log line even on success: a rising correction count over successive runs is
 		# how an operator learns that webhooks or the queue are failing upstream.
@@ -193,6 +196,49 @@ def _as_utc(moment) -> str:
 	if local.tzinfo is None:
 		local = local.replace(tzinfo=ZoneInfo(get_system_timezone()))
 	return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def reconcile_collections(store_doc) -> dict:
+	"""Repair products sitting in the wrong tax collection (spec §12).
+
+	The webhooks and the queue should keep membership right, but a dropped drain or a price
+	edited while the worker was down leaves a product charging the wrong tax on the
+	storefront -- which is the kind of error nobody notices until a return is filed. A no-op
+	on any store that has not mapped any collections.
+	"""
+	from shopify_integration.outbound.collections import sync_item_collections, tax_collection_map
+
+	if not tax_collection_map(store_doc):
+		return {"checked": 0, "corrected": 0, "skipped": "no tax collection map"}
+
+	client = ShopifyClient.for_store(store_doc.name)
+	products = frappe.get_all(
+		"Shopify Item Link",
+		filters={"store": store_doc.name, "product_gid": ["is", "set"]},
+		fields=["item_code", "template_item"],
+	)
+
+	# One product per membership, so a template's variants are not each checked separately.
+	subjects = sorted({row.template_item or row.item_code for row in products})
+
+	checked = corrected = 0
+	warnings = []
+	for item_code in subjects:
+		checked += 1
+		try:
+			outcome = sync_item_collections(client, store_doc, item_code)
+		except Exception as exc:
+			warnings.append(f"{item_code}: {exc}")
+			continue
+		if outcome.get("warning"):
+			warnings.append(outcome["warning"])
+		elif outcome.get("added") or outcome.get("removed"):
+			corrected += 1
+
+	result = {"checked": checked, "corrected": corrected}
+	if warnings:
+		result["warnings"] = warnings[:20]
+	return result
 
 
 def reconcile_orders(store_doc) -> dict:

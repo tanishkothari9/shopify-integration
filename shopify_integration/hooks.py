@@ -52,7 +52,15 @@ doc_events: dict = {
 			# The Item carries a price too -- Standard Selling Rate is where ERPNext puts a
 			# rate typed on the form. Without this it was readable and never sent.
 			"shopify_integration.outbound.price.on_item_change",
+			# Its group or its own tax rows decide which tax band it falls in, and the band
+			# decides which Shopify collection carries the right override.
+			"shopify_integration.outbound.collections.on_item_change",
 		],
+	},
+	# A group's tax rules move every published item under it, which is why this is queued
+	# per item rather than done in the save.
+	"Item Group": {
+		"on_update": "shopify_integration.outbound.collections.on_item_group_change",
 	},
 	# Every physical stock movement: POS, Delivery Note, Stock Entry, Purchase Receipt,
 	# Reconciliation. ERPNext creates SLEs via sle.submit(), so doc events do fire here.
@@ -61,7 +69,11 @@ doc_events: dict = {
 	},
 	# Selling price changes on the store's own price list.
 	"Item Price": {
-		"on_change": "shopify_integration.outbound.price.on_price_change",
+		"on_change": [
+			"shopify_integration.outbound.price.on_price_change",
+			# And the price is what decides the tax band on a banded catalogue.
+			"shopify_integration.outbound.collections.on_price_change",
+		],
 	},
 	# reserved_qty changes, which no stock ledger entry reflects. Without this, a web order
 	# would leave its units looking sellable until the delivery note was made.

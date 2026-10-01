@@ -1,0 +1,9 @@
+# Titles for the collections a store has mapped, to label the rows on the form.
+query collectionTitles($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Collection {
+      id
+      title
+    }
+  }
+}

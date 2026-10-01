@@ -41,6 +41,7 @@ OPERATION_HANDLERS: dict[str, str] = {
 	"product": "shopify_integration.outbound.product.push_products",
 	"price": "shopify_integration.outbound.price.push_prices",
 	"fulfillment": "shopify_integration.outbound.fulfillment.push_fulfillments",
+	"collection": "shopify_integration.outbound.collections.push_collections",
 }
 
 

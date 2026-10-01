@@ -58,6 +58,8 @@
   "location_map",
   "section_taxes",
   "tax_map",
+  "tax_collection_map",
+  "section_tax_collections",
   "default_hsn_code",
   "section_status",
   "installed_on",
@@ -375,6 +377,19 @@
    "fieldtype": "Table",
    "label": "Tax Map",
    "options": "Shopify Tax Mapping"
+  },
+  {
+   "fieldname": "section_tax_collections",
+   "fieldtype": "Section Break",
+   "label": "Tax Collections",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "tax_collection_map",
+   "fieldtype": "Table",
+   "label": "Tax Collection Map",
+   "options": "Shopify Tax Collection",
+   "description": "Puts each product in the Shopify collection whose tax override matches the tax ERPNext will actually book for it, which is what lets a shop with rate bands charge the right tax on the storefront. Leave the table empty and nothing here runs at all. A template that maps to no collection -- your default rate, typically -- means the product is removed from the mapped collections and left to Shopify's own default. Collections you have not listed are never touched."
   },
   {
    "fieldname": "default_hsn_code",

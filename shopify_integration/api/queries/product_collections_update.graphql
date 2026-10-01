@@ -1,0 +1,20 @@
+# Move a product between collections, from the product's side.
+#
+# collectionAddProductsV2 and collectionRemoveProducts, which this was first written against,
+# do not exist in 2026-01. collectionUpdate does take a product list, but it *replaces* the
+# collection's membership, so using it would throw every other product out of a collection
+# to move one in.
+#
+# collectionsToJoin / collectionsToLeave are incremental and cover both directions in one
+# call, and touch nothing but this product.
+mutation productCollections($product: ProductInput!) {
+  productUpdate(product: $product) {
+    product {
+      id
+      collections(first: 50) {
+        nodes { id title }
+      }
+    }
+    userErrors { field message }
+  }
+}

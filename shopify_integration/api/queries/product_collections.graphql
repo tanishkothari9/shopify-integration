@@ -1,0 +1,14 @@
+# Which collections a product is currently in, so membership can be compared before it is
+# changed. `first: 50` because a product in more collections than that is not a tax-band
+# arrangement, and the mapped ones are what matter.
+query productCollections($id: ID!) {
+  product(id: $id) {
+    id
+    collections(first: 50) {
+      nodes {
+        id
+        title
+      }
+    }
+  }
+}

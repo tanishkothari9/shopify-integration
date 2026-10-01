@@ -113,15 +113,13 @@ class TestPriceTriggers(PriceTestCase):
 		self.assertEqual(frappe.db.count("Shopify Sync Queue", {"operation": "price"}), 0)
 
 	def test_the_hook_is_registered(self):
-		from shopify_integration import hooks
+		"""More than one handler listens now -- the price decides the tax band too -- so this
+		asks whether ours is among them rather than whether it is the only one."""
+		registered = (frappe.get_hooks("doc_events").get("Item Price") or {}).get("on_change") or []
+		if not isinstance(registered, list):
+			registered = [registered]
+		self.assertIn("shopify_integration.outbound.price.on_price_change", registered)
 
-		self.assertEqual(
-			hooks.doc_events["Item Price"]["on_change"],
-			"shopify_integration.outbound.price.on_price_change",
-		)
-
-
-class TestPricePush(PriceTestCase):
 	def test_push_sends_the_current_price_grouped_by_product(self):
 		with patch.object(engine, "schedule_drain"):
 			self.set_price(59.99)
