@@ -291,45 +291,74 @@ class TestTheWiring(FrappeTestCase):
 	or the stock push from the link, and these are what notice.
 	"""
 
-	def test_linking_an_item_pushes_its_stock(self):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import SECRET_A, make_store
+
+		cls.store = make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
+
+	def _item(self, code):
+		if not frappe.db.exists("Item", code):
+			item = frappe.new_doc("Item")
+			item.item_code = code
+			item.item_name = code
+			item.item_group = frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0]
+			item.stock_uom = "Nos"
+			with_hsn(item)
+			item.insert(ignore_permissions=True)
+		for link in frappe.get_all(
+			"Shopify Item Link", filters={"store": self.store, "item_code": code}, pluck="name"
+		):
+			frappe.delete_doc("Shopify Item Link", link, force=True, ignore_permissions=True)
+		return code
+
+	def test_writing_a_link_pushes_what_erpnext_holds(self):
+		"""The push sits in `upsert_link` rather than at the call sites, because the call
+		sites race: the `products/create` webhook for a product being published arrives
+		through the mapping, not through the create path, and whichever writes the link first
+		has to be the one that queues the stock."""
 		from unittest.mock import patch
 
 		from shopify_integration.outbound import product as product_module
 
-		with (
-			patch.object(product_module, "push_initial_stock") as pushed,
-			patch("shopify_integration.catalogue.mapping.upsert_link", return_value="LINK"),
-		):
+		code = self._item("ZZ-WIRE-A")
+		with patch.object(product_module, "push_initial_state") as pushed:
 			product_module._link(
-				"Test Store A",
-				"ORD-TEE",
-				{"id": "gid://shopify/Product/1", "variants": [{"id": "gid://shopify/ProductVariant/1"}]},
+				self.store,
+				code,
+				{
+					"id": "gid://shopify/Product/wire-a",
+					"variants": [{"id": "gid://shopify/ProductVariant/wire-a"}],
+				},
 			)
 
-		pushed.assert_called_once()
-		self.assertEqual(pushed.call_args[0][1], "ORD-TEE")
+		pushed.assert_called_once_with(self.store, code)
 
-	def test_linking_variants_pushes_stock_for_each(self):
+	def test_linking_variants_pushes_for_each_variant(self):
 		from unittest.mock import patch
 
 		from shopify_integration.outbound import product as product_module
 
+		self._item("ZZ-WIRE-TPL")
+		self._item("ZZ-WIRE-B")
+		self._item("ZZ-WIRE-C")
 		product = {
-			"id": "gid://shopify/Product/2",
+			"id": "gid://shopify/Product/wire-bc",
 			"variants": [
-				{"id": "gid://shopify/ProductVariant/A", "sku": "ZZ-A"},
-				{"id": "gid://shopify/ProductVariant/B", "sku": "ZZ-B"},
+				{"id": "gid://shopify/ProductVariant/wire-b", "sku": "ZZ-WIRE-B"},
+				{"id": "gid://shopify/ProductVariant/wire-c", "sku": "ZZ-WIRE-C"},
 			],
 		}
-		with (
-			patch.object(product_module, "push_initial_stock") as pushed,
-			patch("shopify_integration.catalogue.mapping.upsert_link", return_value="LINK"),
-		):
+		with patch.object(product_module, "push_initial_state") as pushed:
 			product_module._link_variants(
-				"Test Store A", "ZZ-TPL", product, [{"item_code": "ZZ-A"}, {"item_code": "ZZ-B"}]
+				self.store,
+				"ZZ-WIRE-TPL",
+				product,
+				[{"item_code": "ZZ-WIRE-B"}, {"item_code": "ZZ-WIRE-C"}],
 			)
 
-		self.assertEqual([call[0][1] for call in pushed.call_args_list], ["ZZ-A", "ZZ-B"])
+		self.assertEqual([call[0][1] for call in pushed.call_args_list], ["ZZ-WIRE-B", "ZZ-WIRE-C"])
 
 	def test_a_product_created_active_is_published(self):
 		"""The create path has to hand the product to the Online Store; otherwise every

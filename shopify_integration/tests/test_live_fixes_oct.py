@@ -7,10 +7,19 @@ from unittest.mock import patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-PRODUCT = "gid://shopify/Product/9001"
-VARIANT = "gid://shopify/ProductVariant/9002"
-INVENTORY_ITEM = "gid://shopify/InventoryItem/9003"
 LOCATION = "gid://shopify/Location/5551"
+
+
+def gids(sku: str) -> tuple[str, str, str]:
+	"""Shopify ids for one item. Derived from the SKU, because they must differ per item:
+	`upsert_link` matches on variant_gid first, so a fake that reuses one id makes every test
+	adopt the previous test's link -- watermarks and all."""
+	tail = sku.rsplit("-", 1)[-1]
+	return (
+		f"gid://shopify/Product/{tail}",
+		f"gid://shopify/ProductVariant/{tail}",
+		f"gid://shopify/InventoryItem/{tail}",
+	)
 
 
 class _CreateClient:
@@ -22,15 +31,19 @@ class _CreateClient:
 
 	def __init__(self, sku: str):
 		self.sku = sku
+		self.product, self.variant, self.inventory_item = gids(sku)
 		self.calls: list[dict] = []
 
 	def execute(self, query, variables=None, cost_hint=0):
 		self.calls.append(variables or {})
-		variant = {"id": VARIANT, "sku": self.sku, "inventoryItem": {"id": INVENTORY_ITEM}}
+		variant = {"id": self.variant, "sku": self.sku, "inventoryItem": {"id": self.inventory_item}}
 		return {
-			"productCreate": {"product": {"id": PRODUCT, "variants": {"nodes": [variant]}}, "userErrors": []},
+			"productCreate": {
+				"product": {"id": self.product, "variants": {"nodes": [variant]}},
+				"userErrors": [],
+			},
 			"productVariantsBulkUpdate": {"productVariants": [variant], "userErrors": []},
-			"product": {"id": PRODUCT, "status": "DRAFT", "variants": {"edges": [{"node": variant}]}},
+			"product": {"id": self.product, "status": "DRAFT", "variants": {"edges": [{"node": variant}]}},
 			"publications": {"nodes": []},
 		}
 
@@ -105,8 +118,16 @@ class TestANewProductSendsWhatErpnextAlreadyHas(FrappeTestCase):
 		with_hsn(item)
 		item.insert(ignore_permissions=True)
 		frappe.db.commit()
+		# These helpers commit, so the usual per-test rollback cannot undo them. A stale link
+		# is not inert either: upsert_link matches on it.
 		self.addCleanup(frappe.db.commit)
+		self.addCleanup(self._forget, code)
 		return item
+
+	def _forget(self, item_code):
+		for link in frappe.get_all("Shopify Item Link", filters={"item_code": item_code}, pluck="name"):
+			frappe.delete_doc("Shopify Item Link", link, force=True, ignore_permissions=True)
+		frappe.db.delete("Shopify Sync Queue", {"ref_docname": item_code})
 
 	def test_opening_stock_reaches_shopify(self):
 		"""The whole path: seven on the shelf before publishing, seven in the mutation."""
@@ -126,7 +147,7 @@ class TestANewProductSendsWhatErpnextAlreadyHas(FrappeTestCase):
 			product_gid = _create_product_unlocked(_CreateClient(item.name), self.store, item.name)
 		frappe.db.commit()
 
-		self.assertEqual(product_gid, PRODUCT)
+		self.assertEqual(product_gid, gids(item.name)[0])
 		rows = frappe.get_all(
 			"Shopify Sync Queue",
 			filters={"store": self.store, "operation": "inventory"},
@@ -143,7 +164,7 @@ class TestANewProductSendsWhatErpnextAlreadyHas(FrappeTestCase):
 			[7],
 			"Shopify was told how many are actually on the shelf",
 		)
-		self.assertEqual(client.quantities[0]["inventoryItemId"], INVENTORY_ITEM)
+		self.assertEqual(client.quantities[0]["inventoryItemId"], gids(item.name)[2])
 		self.assertEqual(client.quantities[0]["locationId"], LOCATION)
 
 	def test_the_price_is_sent_too(self):
@@ -153,6 +174,10 @@ class TestANewProductSendsWhatErpnextAlreadyHas(FrappeTestCase):
 		from shopify_integration.sync import engine
 
 		item = self._item_with_opening_stock(f"ZZ-OPENPRICE-{frappe.generate_hash(length=6)}", 3)
+		# The rate typed on the Item form, which is where most merchants put it.
+		frappe.db.set_value("Item", item.name, "standard_rate", 1200)
+		frappe.db.delete("Shopify Sync Queue", {"store": self.store})
+		frappe.db.commit()
 		with patch.object(engine, "schedule_drain"), patch("shopify_integration.sync.engine.schedule_drain"):
 			_create_product_unlocked(_CreateClient(item.name), self.store, item.name)
 		frappe.db.commit()
@@ -536,3 +561,243 @@ class TestAChangedImageReachesShopify(FrappeTestCase):
 		_sync_image(client, link.product_gid, item, self.store)
 
 		self.assertEqual(client.created, [])
+
+
+class TestTheWebhookRacingTheOutboundCreate(FrappeTestCase):
+	"""Publishing a product makes Shopify fire products/create straight back, and it arrives
+	while the job that caused it is still running.
+
+	On 1 October that webhook wrote STOITEM202605498's link at 21:47:02.96, 130ms before the
+	publishing job finished. The webhook writes links through the catalogue mapping, which
+	never queued stock; the job then found a link where it expected none and took the update
+	branch, which queues neither stock nor price. Nothing was left to correct it: the item
+	had no inventory row in the queue at any point, and its link's inventory_synced_on stayed
+	NULL. It went live at zero.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import SECRET_A, make_store
+
+		cls.store = make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
+		store_doc = frappe.get_doc("Shopify Store", cls.store)
+		cls.company = store_doc.company
+		cls.warehouse = frappe.db.get_value("Warehouse", {"company": cls.company, "is_group": 0}, "name")
+		store_doc.default_warehouse = cls.warehouse
+		store_doc.sync_inventory = 1
+		store_doc.sync_prices = 1
+		store_doc.set("location_map", [])
+		store_doc.append("location_map", {"warehouse": cls.warehouse, "location_gid": LOCATION})
+		store_doc.flags.ignore_mandatory = True
+		store_doc.save(ignore_permissions=True)
+		frappe.db.commit()
+
+	def setUp(self):
+		frappe.db.delete("Shopify Sync Queue", {"store": self.store})
+		frappe.db.commit()
+
+	def _item(self, qty):
+		from shopify_integration.tests.test_integration import with_hsn
+
+		code = f"ZZ-RACE-{frappe.generate_hash(length=6)}"
+		item = frappe.new_doc("Item")
+		item.item_code = code
+		item.item_name = code
+		item.item_group = frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0]
+		item.stock_uom = "Nos"
+		item.is_stock_item = 1
+		item.opening_stock = qty
+		item.valuation_rate = 100
+		item.append("item_defaults", {"company": self.company, "default_warehouse": self.warehouse})
+		with_hsn(item)
+		item.insert(ignore_permissions=True)
+		frappe.db.commit()
+		# These helpers commit, so the usual per-test rollback cannot undo them. A stale link
+		# is not inert either: upsert_link matches on it.
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(self._forget, code)
+		return item
+
+	def _forget(self, item_code):
+		for link in frappe.get_all("Shopify Item Link", filters={"item_code": item_code}, pluck="name"):
+			frappe.delete_doc("Shopify Item Link", link, force=True, ignore_permissions=True)
+		frappe.db.delete("Shopify Sync Queue", {"ref_docname": item_code})
+
+	def _webhook_product(self, sku):
+		"""What Shopify echoes back for the product just created."""
+		product, variant, inventory_item = gids(sku)
+		return {
+			"id": product,
+			"title": sku,
+			"status": "ACTIVE",
+			"options": [],
+			"variants": [
+				{"id": variant, "sku": sku, "price": "0.00", "inventoryItem": {"id": inventory_item}}
+			],
+		}
+
+	def test_the_webhook_winning_the_link_leaves_nothing_to_send_the_stock(self):
+		"""The live shape, in order.
+
+		The webhook writes the link through the catalogue mapping. The outbound product row
+		drains afterwards, finds a link where it expected none, and takes the update branch
+		-- which sends a title and a status and nothing else. Neither half queued the stock,
+		and STOITEM202605498 went live at zero.
+		"""
+		from shopify_integration.api.client import ShopifyClient
+		from shopify_integration.catalogue.mapping import write_product_mapping
+		from shopify_integration.outbound.product import push_products
+		from shopify_integration.sync import engine
+
+		item = self._item(7)
+
+		with patch.object(engine, "schedule_drain"), patch("shopify_integration.sync.engine.schedule_drain"):
+			write_product_mapping(self.store, self._webhook_product(item.name))
+			frappe.db.commit()
+
+			client = _CreateClient(item.name)
+			with patch.object(ShopifyClient, "for_store", return_value=client):
+				push_products(self.store, [{"ref_docname": item.name}])
+		frappe.db.commit()
+
+		links = frappe.get_all("Shopify Item Link", filters={"store": self.store, "item_code": item.name})
+		self.assertEqual(len(links), 1, "the two paths must converge on one link, not two")
+
+		queued = frappe.get_all(
+			"Shopify Sync Queue",
+			filters={"store": self.store, "operation": "inventory"},
+			pluck="dedupe_key",
+		)
+		self.assertTrue(
+			[k for k in queued if item.name in k],
+			"whichever path wrote the link first had to queue the stock -- this is the row "
+			"STOITEM202605498 never had, at any point",
+		)
+
+	def test_a_webhook_landing_mid_publish_still_leaves_stock_queued(self):
+		"""The other order: the echo arrives while the create is still running, so the job
+		adopts a link it did not write."""
+		from shopify_integration.catalogue.mapping import write_product_mapping
+		from shopify_integration.outbound.product import _create_product_unlocked
+		from shopify_integration.sync import engine
+
+		item = self._item(7)
+		landed = []
+
+		class _RacingClient(_CreateClient):
+			def execute(inner, query, variables=None, cost_hint=0):
+				result = super().execute(query, variables, cost_hint)
+				if not landed:
+					landed.append(write_product_mapping(self.store, self._webhook_product(item.name)))
+				return result
+
+		with patch.object(engine, "schedule_drain"), patch("shopify_integration.sync.engine.schedule_drain"):
+			_create_product_unlocked(_RacingClient(item.name), self.store, item.name)
+		frappe.db.commit()
+
+		self.assertTrue(landed, "the webhook has to have landed, or this tests nothing")
+		self.assertEqual(
+			len(frappe.get_all("Shopify Item Link", filters={"store": self.store, "item_code": item.name})),
+			1,
+		)
+		queued = frappe.get_all(
+			"Shopify Sync Queue", filters={"store": self.store, "operation": "inventory"}, pluck="dedupe_key"
+		)
+		self.assertTrue([k for k in queued if item.name in k])
+
+	def test_the_queued_row_drains_to_shopify(self):
+		"""And the row is worth having: it carries the real figure and marks the link synced."""
+		from shopify_integration.api.client import ShopifyClient
+		from shopify_integration.catalogue.mapping import write_product_mapping
+		from shopify_integration.outbound.inventory import push_inventory
+		from shopify_integration.sync import engine
+
+		item = self._item(7)
+		with patch.object(engine, "schedule_drain"), patch("shopify_integration.sync.engine.schedule_drain"):
+			write_product_mapping(self.store, self._webhook_product(item.name))
+		frappe.db.commit()
+
+		rows = frappe.get_all(
+			"Shopify Sync Queue",
+			filters={"store": self.store, "operation": "inventory"},
+			fields=["name", "dedupe_key", "payload"],
+		)
+		self.assertTrue(rows)
+
+		client = _InventoryClient()
+		with patch.object(ShopifyClient, "for_store", return_value=client):
+			push_inventory(self.store, rows)
+		frappe.db.commit()
+
+		self.assertEqual([q["quantity"] for q in client.quantities], [7])
+		self.assertIsNotNone(
+			frappe.db.get_value(
+				"Shopify Item Link", {"store": self.store, "item_code": item.name}, "inventory_synced_on"
+			),
+			"a drained push marks the link, which is what stops this firing for ever",
+		)
+
+	def test_an_imported_product_does_not_have_its_shopify_stock_zeroed(self):
+		"""The hazard in pushing from the inbound path. A catalogue imported *from* Shopify
+		creates ERPNext Items with no stock, and sending that zero would wipe the quantity
+		the merchant actually has on the shelf."""
+		from shopify_integration.catalogue.mapping import write_product_mapping
+		from shopify_integration.sync import engine
+
+		sku = f"ZZ-IMPORTED-{frappe.generate_hash(length=6)}"
+		with patch.object(engine, "schedule_drain"), patch("shopify_integration.sync.engine.schedule_drain"):
+			write_product_mapping(self.store, self._webhook_product(sku))
+		frappe.db.commit()
+
+		queued = frappe.get_all(
+			"Shopify Sync Queue", filters={"store": self.store, "operation": "inventory"}, pluck="dedupe_key"
+		)
+		self.assertEqual([k for k in queued if sku in k], [], "ERPNext knows nothing about this item's stock")
+
+	def test_queuing_is_idempotent(self):
+		"""Both paths can run, and a product push repeats on every save. One row."""
+		from shopify_integration.catalogue.mapping import write_product_mapping
+		from shopify_integration.outbound.product import push_initial_state
+		from shopify_integration.sync import engine
+
+		item = self._item(7)
+		with patch.object(engine, "schedule_drain"), patch("shopify_integration.sync.engine.schedule_drain"):
+			write_product_mapping(self.store, self._webhook_product(item.name))
+			for _ in range(4):
+				push_initial_state(self.store, item.name)
+		frappe.db.commit()
+
+		rows = frappe.get_all(
+			"Shopify Sync Queue",
+			filters={"store": self.store, "operation": "inventory", "state": "Pending"},
+			pluck="dedupe_key",
+		)
+		self.assertEqual(len([k for k in rows if item.name in k]), 1)
+
+	def test_a_synced_link_stops_asking(self):
+		"""Past the watermark it is not initial state any more -- the ordinary stock hooks own
+		it from here, and re-sending on every link write would be a push per save."""
+		from shopify_integration.catalogue.mapping import write_product_mapping
+		from shopify_integration.outbound.product import push_initial_state
+		from shopify_integration.sync import engine
+
+		item = self._item(7)
+		with patch.object(engine, "schedule_drain"), patch("shopify_integration.sync.engine.schedule_drain"):
+			write_product_mapping(self.store, self._webhook_product(item.name))
+			frappe.db.set_value(
+				"Shopify Item Link",
+				{"store": self.store, "item_code": item.name},
+				"inventory_synced_on",
+				frappe.utils.now_datetime(),
+			)
+			frappe.db.delete("Shopify Sync Queue", {"store": self.store})
+			push_initial_state(self.store, item.name)
+		frappe.db.commit()
+
+		self.assertEqual(
+			frappe.get_all(
+				"Shopify Sync Queue", filters={"store": self.store, "operation": "inventory"}, pluck="name"
+			),
+			[],
+		)

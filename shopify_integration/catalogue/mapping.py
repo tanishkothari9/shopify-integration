@@ -713,9 +713,24 @@ def upsert_link(
 		link.save(ignore_permissions=True)
 		return link.name
 
+	def _written(name: str) -> str:
+		"""Whatever ERPNext already knows about this item, now that there is somewhere to
+		send it.
+
+		Here rather than at the call sites because the call sites race each other: the
+		webhook for a product this app is in the middle of publishing arrives through this
+		same function, and whichever of the two writes the link first has to be the one that
+		queues the stock. Outside the savepoint above, so a failure to enqueue is never
+		mistaken for the insert losing a race.
+		"""
+		from shopify_integration.outbound.product import push_initial_state
+
+		push_initial_state(store, item_code)
+		return name
+
 	existing = _find()
 	if existing:
-		return _write(existing)
+		return _written(_write(existing))
 
 	# Nothing found, so this is an insert -- and inserts race. Publishing a product from
 	# ERPNext makes Shopify fire `products/create` straight back, and that webhook lands while
@@ -750,9 +765,12 @@ def upsert_link(
 			},
 			update_modified=False,
 		)
-		return raced
+		# The winner wrote this link, and went through this same function to do it, so it is
+		# the one that queued the stock. This covers the timings where the loser can see the
+		# row too; the enqueue deduplicates either way.
+		return _written(raced)
 
 	# Released here, not in an `else:` -- a `return` inside the `try` would skip the `else`
 	# entirely and leak a savepoint on every successful insert.
 	frappe.db.release_savepoint(save_point)
-	return name
+	return _written(name)

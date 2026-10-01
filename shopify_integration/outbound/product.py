@@ -718,6 +718,73 @@ def push_initial_price(store: str, item_code: str) -> int:
 	return enqueue_price(store, item_code) or 0
 
 
+def push_initial_state(store: str, item_code: str) -> None:
+	"""Send the stock and the price ERPNext already holds for a freshly linked item.
+
+	Called from `upsert_link`, so it runs from whichever path writes the link first -- and
+	they race. Publishing a product makes Shopify fire `products/create` straight back, and
+	that webhook writes its own link through the catalogue mapping, which creating the
+	product knows nothing about. On 1 October it wrote STOITEM202605498's link at 21:47:02.96
+	while the job publishing that very item still had 130ms to run. The job then found a link
+	where it expected none, took the update branch -- which sends neither stock nor price --
+	and the item went live at zero with no queue row anywhere to correct it.
+
+	Doing it here instead of at each call site is the point: there is one place a link comes
+	into existence, and this is it.
+
+	Idempotent twice over. A link past its watermark is left alone, so this stops firing once
+	the figure has actually gone; and both pushes are deduplicated enqueues, so however many
+	paths call this for one item, one row is queued and one row drains.
+	"""
+	link = frappe.db.get_value(
+		"Shopify Item Link",
+		{"store": store, "item_code": item_code},
+		["inventory_synced_on", "price_synced_on"],
+		as_dict=True,
+	)
+	if not link:
+		return
+
+	if not link.inventory_synced_on and _erpnext_holds_stock(store, item_code):
+		push_initial_stock(store, item_code)
+	if not link.price_synced_on and _erpnext_holds_a_price(store, item_code):
+		push_initial_price(store, item_code)
+
+
+def _erpnext_holds_stock(store: str, item_code: str) -> bool:
+	"""Whether ERPNext has a quantity worth sending.
+
+	Nothing on hand means nothing to say -- and saying it would be destructive. Importing a
+	catalogue *from* Shopify creates ERPNext Items with no stock at all, and this runs on
+	those links too; pushing their zero over the merchant's real Shopify quantity is the one
+	mistake it must never make. A product ERPNext publishes starts at zero on Shopify anyway,
+	so staying quiet about a zero costs nothing either way.
+
+	An import that matches an item ERPNext already stocks does push, which is the contract
+	`sync_inventory` describes: once the two are linked, ERPNext owns the count, and the
+	nightly reconciliation would send the same figure a few hours later regardless.
+	"""
+	from shopify_integration.outbound.inventory import available_for_location
+
+	store_doc = frappe.get_cached_doc("Shopify Store", store)
+	if not store_doc.sync_inventory:
+		return False
+
+	return any(
+		available_for_location(store_doc, item_code, row.location_gid)
+		for row in store_doc.location_map or []
+		if row.location_gid
+	)
+
+
+def _erpnext_holds_a_price(store: str, item_code: str) -> bool:
+	"""Same rule for the price: send one if there is one, and never overwrite with nothing."""
+	store_doc = frappe.get_cached_doc("Shopify Store", store)
+	if not store_doc.sync_prices:
+		return False
+	return _selling_price(item_code, store_doc) is not None
+
+
 def _link(store: str, item_code: str, product: dict) -> None:
 	from shopify_integration.catalogue.mapping import upsert_link
 
@@ -726,8 +793,6 @@ def _link(store: str, item_code: str, product: dict) -> None:
 	upsert_link(store, item_code=item_code, product=product, variant=variant, is_variant=False)
 	if _publish_pending.pop(cstr(product.get("id")), False):
 		_mark_publish_decided(store, cstr(product.get("id")))
-	push_initial_stock(store, item_code)
-	push_initial_price(store, item_code)
 
 
 # --------------------------------------------------------------------------------------
@@ -854,8 +919,6 @@ def _link_variants(store: str, template: str, product: dict, children: list[dict
 			is_variant=True,
 			template_item=template,
 		)
-		push_initial_stock(store, child["item_code"])
-		push_initial_price(store, child["item_code"])
 
 	if _publish_pending.pop(cstr(product.get("id")), False):
 		_mark_publish_decided(store, cstr(product.get("id")))
