@@ -6,7 +6,12 @@ requires-python = ">=3.10,<3.15"
 readme = "README.md"
 dynamic = ["version"]
 license = { text = "GPL-3.0-or-later" }
-dependencies = []
+dependencies = [
+    # Checks every document in api/queries/ against the vendored Admin API schema, so a type
+    # Shopify would reject fails here rather than in production. See
+    # shopify_integration/tests/test_graphql_queries.py.
+    "graphql-core>=3.2",
+]
 
 [project.urls]
 Homepage = "https://github.com/tanishkothari9/shopify-integration"

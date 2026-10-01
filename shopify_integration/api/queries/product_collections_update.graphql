@@ -7,7 +7,12 @@
 #
 # collectionsToJoin / collectionsToLeave are incremental and cover both directions in one
 # call, and touch nothing but this product.
-mutation productCollections($product: ProductInput!) {
+#
+# ProductUpdateInput, not ProductInput: 2026-01 split the old input type, and productUpdate
+# takes the update half. Declaring the wrong one is rejected before the mutation runs --
+# "Type mismatch on variable $product and argument product" -- so every collection sync
+# failed, and the fake client in the tests could not have noticed.
+mutation productCollections($product: ProductUpdateInput!) {
   productUpdate(product: $product) {
     product {
       id
