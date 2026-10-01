@@ -323,3 +323,162 @@ class TestItIsWiredUp(FrappeTestCase):
 		from shopify_integration.sync import reconcile
 
 		self.assertIn("reconcile_collections", inspect.getsource(reconcile.reconcile_store))
+
+
+class TestSavingAnItemGroupStaysCheap(FrappeTestCase):
+	"""The hook runs inside somebody's save, and a real group is enormous.
+
+	SAREE holds 39,384 items on the live site and the root holds 77,667. Walking them in the
+	save at two or three queries each was something like a hundred thousand queries in one
+	request, which does not slow the save down so much as end it.
+	"""
+
+	def setUp(self):
+		self.made = []
+		self.group = self._group("ZZ Tax Group")
+
+	def tearDown(self):
+		for doctype, name in reversed(self.made):
+			frappe.delete_doc(doctype, name, force=True, ignore_permissions=True, ignore_missing=True)
+		frappe.db.commit()
+
+	def _group(self, label):
+		name = f"{label} {frappe.generate_hash(length=5)}"
+		doc = frappe.new_doc("Item Group")
+		doc.item_group_name = name
+		doc.parent_item_group = frappe.db.get_value("Item Group", {"is_group": 1}, "name")
+		doc.is_group = 0
+		doc.insert(ignore_permissions=True)
+		self.made.append(("Item Group", doc.name))
+		frappe.db.commit()
+		return doc.name
+
+	def _items(self, count):
+		from shopify_integration.tests.test_integration import with_hsn
+
+		for index in range(count):
+			code = f"ZZ-GRP-{index}-{frappe.generate_hash(length=4)}"
+			doc = frappe.new_doc("Item")
+			doc.item_code = code
+			doc.item_name = code
+			doc.item_group = self.group
+			doc.stock_uom = "Nos"
+			with_hsn(doc)
+			doc.insert(ignore_permissions=True)
+			self.made.append(("Item", code))
+		frappe.db.commit()
+
+	def _queries_to_save(self):
+		"""How many statements one save of the group costs, counting only our hook's."""
+		from shopify_integration.outbound import collections as module
+
+		counted = []
+		real_sql = frappe.db.sql
+
+		def counting(*args, **kwargs):
+			counted.append(1)
+			return real_sql(*args, **kwargs)
+
+		doc = frappe.get_doc("Item Group", self.group)
+		with (
+			patch.object(frappe.db, "sql", side_effect=counting),
+			patch.object(module, "_taxes_changed", return_value=True),
+			patch.object(module.frappe, "enqueue") as enqueued,
+		):
+			module.on_item_group_change(doc)
+
+		return len(counted), enqueued.called
+
+	def test_the_cost_does_not_grow_with_the_group(self):
+		"""The property that matters: the same work whether the group holds nothing or a
+		catalogue. Forty stands in for forty thousand -- what is being asserted is that the
+		number does not move, and a number that does not move at 40 does not move at 40,000."""
+		with patch("shopify_integration.outbound.collections._any_store_maps_collections", return_value=True):
+			empty, _ = self._queries_to_save()
+			self._items(40)
+			full, enqueued = self._queries_to_save()
+
+		self.assertEqual(
+			full, empty, f"saving cost {empty} queries empty and {full} with 40 items in the group"
+		)
+		self.assertTrue(enqueued, "and the real work goes to a worker")
+
+	def test_nothing_happens_at_all_when_no_store_maps_collections(self):
+		"""The common case on every site that does not use this: one query and out."""
+		from shopify_integration.outbound import collections as module
+
+		self._items(5)
+		doc = frappe.get_doc("Item Group", self.group)
+		with (
+			patch.object(module, "_any_store_maps_collections", return_value=False),
+			patch.object(module.frappe, "enqueue") as enqueued,
+			patch.object(module, "_taxes_changed") as changed,
+		):
+			module.on_item_group_change(doc)
+
+		self.assertFalse(enqueued.called)
+		self.assertFalse(changed.called, "it should not even look at what changed")
+
+	def test_a_save_that_did_not_touch_the_taxes_does_nothing(self):
+		"""Groups are saved for renames, re-parenting and descriptions. None of those can
+		move an item between tax bands."""
+		from shopify_integration.outbound import collections as module
+
+		doc = frappe.get_doc("Item Group", self.group)
+		with (
+			patch.object(module, "_any_store_maps_collections", return_value=True),
+			patch.object(module, "_taxes_changed", return_value=False),
+			patch.object(module.frappe, "enqueue") as enqueued,
+		):
+			module.on_item_group_change(doc)
+
+		self.assertFalse(enqueued.called)
+
+
+class TestSpottingATaxChange(FrappeTestCase):
+	from shopify_integration.outbound.collections import _taxes_changed as _changed
+
+	def _group(self, taxes):
+		doc = frappe._dict(
+			taxes=[frappe._dict(row) for row in taxes],
+			get=lambda key, default=None: doc_taxes if key == "taxes" else default,
+		)
+		doc_taxes = doc.taxes
+		doc.get_doc_before_save = lambda: None
+		return doc
+
+	def test_a_new_group_with_rules_counts_as_changed(self):
+		from shopify_integration.outbound.collections import _taxes_changed
+
+		doc = self._group([{"item_tax_template": FIVE, "minimum_net_rate": 0, "maximum_net_rate": 2500}])
+		self.assertTrue(_taxes_changed(doc))
+
+	def test_a_new_group_with_no_rules_is_not_a_change(self):
+		from shopify_integration.outbound.collections import _taxes_changed
+
+		self.assertFalse(_taxes_changed(self._group([])))
+
+	def test_an_identical_table_is_not_a_change(self):
+		from shopify_integration.outbound.collections import _taxes_changed
+
+		rows = [{"item_tax_template": FIVE, "minimum_net_rate": 0, "maximum_net_rate": 2500}]
+		doc = self._group(rows)
+		before = self._group(rows)
+		doc.get_doc_before_save = lambda: before
+		self.assertFalse(_taxes_changed(doc))
+
+	def test_a_moved_band_is_a_change(self):
+		from shopify_integration.outbound.collections import _taxes_changed
+
+		doc = self._group([{"item_tax_template": FIVE, "minimum_net_rate": 0, "maximum_net_rate": 3000}])
+		before = self._group([{"item_tax_template": FIVE, "minimum_net_rate": 0, "maximum_net_rate": 2500}])
+		doc.get_doc_before_save = lambda: before
+		self.assertTrue(_taxes_changed(doc))
+
+	def test_a_different_template_is_a_change(self):
+		from shopify_integration.outbound.collections import _taxes_changed
+
+		doc = self._group([{"item_tax_template": EIGHTEEN, "minimum_net_rate": 0, "maximum_net_rate": 2500}])
+		before = self._group([{"item_tax_template": FIVE, "minimum_net_rate": 0, "maximum_net_rate": 2500}])
+		doc.get_doc_before_save = lambda: before
+		self.assertTrue(_taxes_changed(doc))

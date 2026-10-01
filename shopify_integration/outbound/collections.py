@@ -149,15 +149,120 @@ def on_price_change(doc, method=None):
 
 
 def on_item_group_change(doc, method=None):
-	"""An Item Group's tax rules changed: every published item under it may have moved.
+	"""An Item Group's tax rules changed, so items under it may have moved band.
 
-	Queued per item rather than done here, because a group near the root of the tree can
-	cover thousands, and this runs inside somebody's save.
+	Everything expensive happens in a background job. This runs inside somebody's save, and
+	an Item Group near the root of a real catalogue covers an enormous number of items --
+	SAREE has 39,384 and the root 77,667. Walking them here at two or three queries each was
+	something like a hundred thousand queries in one request, which does not slow the save
+	down so much as end it.
+
+	So the save does three cheap things and stops: is anybody using this feature, did the
+	taxes actually change, and if so hand the group to a worker.
 	"""
-	groups = [doc.name, *_descendant_groups(doc.name)]
-	items = frappe.get_all("Item", filters={"item_group": ["in", groups], "disabled": 0}, pluck="name")
-	for item_code in items:
-		_enqueue_for_stores(item_code)
+	if not _any_store_maps_collections():
+		return
+
+	if not _taxes_changed(doc):
+		# Item Groups are saved for all sorts of reasons -- a rename, a parent move, a
+		# description. Only a change to the tax rules can move an item between bands.
+		return
+
+	frappe.enqueue(
+		"shopify_integration.outbound.collections.recheck_item_group",
+		queue="long",
+		job_id=f"shopify_tax_collections::{doc.name}",
+		deduplicate=True,
+		enqueue_after_commit=True,
+		item_group=doc.name,
+	)
+
+
+def _any_store_maps_collections() -> bool:
+	"""Whether this feature is switched on for a store that is actually running.
+
+	One query, and on a site that does not use this it is the only one the hook costs. A
+	disabled store does not count: its map may be half-built or left over from a shop that
+	has moved on, and nothing is pushed to it either way.
+	"""
+	return bool(
+		frappe.db.sql(
+			"""
+			SELECT 1
+			FROM `tabShopify Tax Collection` row
+			JOIN `tabShopify Store` store
+			  ON store.name = row.parent
+			 AND row.parenttype = 'Shopify Store'
+			 AND IFNULL(store.enabled, 0) = 1
+			WHERE IFNULL(row.collection_gid, '') != ''
+			LIMIT 1
+			"""
+		)
+	)
+
+
+def _taxes_changed(doc) -> bool:
+	"""Whether the save actually altered the group's tax rules.
+
+	Compared in memory against the version before the save, so it costs nothing. A new group
+	with rules counts; one saved without a previous version to compare cannot be ruled out,
+	so it is treated as changed.
+	"""
+	before = doc.get_doc_before_save()
+	if before is None:
+		return bool(doc.get("taxes"))
+
+	def rules(source):
+		return [
+			(
+				cstr(row.item_tax_template),
+				flt(row.minimum_net_rate),
+				flt(row.maximum_net_rate),
+				cstr(row.get("valid_from")),
+				cstr(row.get("tax_category")),
+			)
+			for row in (source.get("taxes") or [])
+		]
+
+	return rules(doc) != rules(before)
+
+
+def recheck_item_group(item_group: str) -> dict:
+	"""Re-check every *published* item under a group, in batches. Runs in a worker.
+
+	Only published items, found by joining to the links rather than by listing the group's
+	items and asking about each: on a catalogue of 77,667 items under the root, perhaps a
+	few hundred are on Shopify, and the other seventy-seven thousand must not cost a query
+	apiece to discard.
+	"""
+	if not _any_store_maps_collections():
+		return {"skipped": "no store maps collections"}
+
+	groups = [item_group, *_descendant_groups(item_group)]
+	published = frappe.db.sql(
+		"""
+		SELECT DISTINCT link.store, COALESCE(NULLIF(link.template_item, ''), link.item_code) AS item_code
+		FROM `tabShopify Item Link` link
+		JOIN `tabItem` item ON item.name = link.item_code
+		WHERE item.item_group IN %(groups)s
+		  AND IFNULL(item.disabled, 0) = 0
+		  AND IFNULL(link.product_gid, '') != ''
+		""",
+		{"groups": tuple(groups)},
+		as_dict=True,
+	)
+
+	queued = 0
+	for row in published:
+		if enqueue_for_item(row.store, row.item_code):
+			queued += 1
+
+	if queued:
+		frappe.db.commit()
+		frappe.logger("shopify_integration").info(
+			f"Item Group {item_group}: queued {queued} product(s) for a tax collection re-check"
+		)
+	return {"checked": len(published), "queued": queued}
 
 
 def _descendant_groups(group: str) -> list[str]:
