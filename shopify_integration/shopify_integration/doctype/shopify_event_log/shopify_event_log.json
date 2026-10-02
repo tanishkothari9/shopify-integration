@@ -12,6 +12,8 @@
   "column_break_1",
   "status",
   "processed_on",
+  "attempts",
+  "next_attempt_at",
   "ref_doctype",
   "ref_docname",
   "result",
@@ -111,6 +113,20 @@
    "fieldtype": "Long Text",
    "label": "Traceback",
    "read_only": 1
+  },
+  {
+   "fieldname": "attempts",
+   "fieldtype": "Int",
+   "label": "Attempts",
+   "read_only": 1,
+   "description": "How many times the handler has been run for this event, including the first."
+  },
+  {
+   "fieldname": "next_attempt_at",
+   "fieldtype": "Datetime",
+   "label": "Next Attempt At",
+   "read_only": 1,
+   "description": "When the scheduled sweep may try this failed event again. Empty once it has given up."
   }
  ],
  "index_web_pages_for_search": 1,

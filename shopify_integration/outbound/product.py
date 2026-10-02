@@ -24,6 +24,7 @@ from frappe.utils import cstr
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import is_echo
+from shopify_integration.exceptions import PartialFailure
 from shopify_integration.outbound.media import enqueue_media
 from shopify_integration.shopify_integration.doctype.shopify_item_link.shopify_item_link import (
 	linked_stores,
@@ -153,69 +154,81 @@ def push_products(store: str, rows: list[dict]) -> None:
 	"""
 	client = ShopifyClient.for_store(store)
 
+	failures: dict[str, Exception] = {}
+
 	for row in rows:
-		item_code = row.get("ref_docname")
-		if not item_code or not frappe.db.exists("Item", item_code):
-			continue
-
-		link = product_link_for(store, item_code)
-		if not link or not link.product_gid:
-			if _attach_to_published_template(client, store, item_code):
+		try:
+			item_code = row.get("ref_docname")
+			if not item_code or not frappe.db.exists("Item", item_code):
 				continue
 
-			if _should_publish(store, item_code):
-				_create_product(client, store, item_code)
+			link = product_link_for(store, item_code)
+			if not link or not link.product_gid:
+				if _attach_to_published_template(client, store, item_code):
+					continue
+
+				if _should_publish(store, item_code):
+					_create_product(client, store, item_code)
+					continue
+
+				# Unmapped and not meant for this shop. Usually a products/delete webhook unlinked
+				# it while this row was still pending. Skipped rather than raised: raising here
+				# fails every *other* row in the claimed batch too, and the queue's whole promise
+				# is that a poison row never blocks the ones behind it.
+				frappe.logger("shopify_integration").info(
+					f"Skipping {item_code}: no Shopify product mapping for store {store}"
+				)
 				continue
 
-			# Unmapped and not meant for this shop. Usually a products/delete webhook unlinked
-			# it while this row was still pending. Skipped rather than raised: raising here
-			# fails every *other* row in the claimed batch too, and the queue's whole promise
-			# is that a poison row never blocks the ones behind it.
-			frappe.logger("shopify_integration").info(
-				f"Skipping {item_code}: no Shopify product mapping for store {store}"
-			)
-			continue
+			# The product belongs to the template, not to the variant that was saved. A variant's
+			# link carries the *parent* product's gid -- every child of a template shares one --
+			# so building the payload from the variant sent the whole product's status and title
+			# from one size. Disabling a single out-of-production size archived the entire range
+			# from the storefront, and with sync_item_titles on it renamed the product to
+			# "Kurta Set - Red / XXL".
+			subject = frappe.get_cached_value("Item", item_code, "variant_of") or item_code
+			item = frappe.get_doc("Item", subject)
 
-		# The product belongs to the template, not to the variant that was saved. A variant's
-		# link carries the *parent* product's gid -- every child of a template shares one --
-		# so building the payload from the variant sent the whole product's status and title
-		# from one size. Disabling a single out-of-production size archived the entire range
-		# from the storefront, and with sync_item_titles on it renamed the product to
-		# "Kurta Set - Red / XXL".
-		subject = frappe.get_cached_value("Item", item_code, "variant_of") or item_code
-		item = frappe.get_doc("Item", subject)
+			# Only what ERPNext actually owns. Shopify holds the storefront copy: the title a
+			# customer reads and the description someone wrote for the product page. Sending
+			# ERPNext's item_name and description on every save destroyed both -- a merchant
+			# adjusting an item's *weight* replaced "Banarasi Silk Saree, Festive Edition" with
+			# the plain item name, and wiped the marketing HTML under it.
+			#
+			# Whether the item is sellable is ERPNext's to say, so status still goes.
+			payload = {
+				"id": link.product_gid,
+				"status": "ARCHIVED" if _product_is_dead(subject, item) else "ACTIVE",
+			}
 
-		# Only what ERPNext actually owns. Shopify holds the storefront copy: the title a
-		# customer reads and the description someone wrote for the product page. Sending
-		# ERPNext's item_name and description on every save destroyed both -- a merchant
-		# adjusting an item's *weight* replaced "Banarasi Silk Saree, Festive Edition" with
-		# the plain item name, and wiped the marketing HTML under it.
-		#
-		# Whether the item is sellable is ERPNext's to say, so status still goes.
-		payload = {
-			"id": link.product_gid,
-			"status": "ARCHIVED" if _product_is_dead(subject, item) else "ACTIVE",
-		}
+			if frappe.db.get_value("Shopify Store", store, "sync_item_titles"):
+				payload["title"] = cstr(item.item_name)[:255]
+				payload["descriptionHtml"] = cstr(item.description or "")
 
-		if frappe.db.get_value("Shopify Store", store, "sync_item_titles"):
-			payload["title"] = cstr(item.item_name)[:255]
-			payload["descriptionHtml"] = cstr(item.description or "")
+			# Read Shopify's current status only for a product this app has never considered
+			# publishing -- one created before it did so. Once the decision is recorded, no later
+			# save costs an extra call, and none revisits it: a product that is ACTIVE and off the
+			# channel was taken off by the merchant, and an ERPNext save must not overrule that.
+			pending = payload["status"] == "ACTIVE" and not _publish_decided(store, link.product_gid)
+			was = _shopify_status(client, link.product_gid) if pending else None
 
-		# Read Shopify's current status only for a product this app has never considered
-		# publishing -- one created before it did so. Once the decision is recorded, no later
-		# save costs an extra call, and none revisits it: a product that is ACTIVE and off the
-		# channel was taken off by the merchant, and an ERPNext save must not overrule that.
-		pending = payload["status"] == "ACTIVE" and not _publish_decided(store, link.product_gid)
-		was = _shopify_status(client, link.product_gid) if pending else None
+			client.execute(load_query("product_update"), {"product": payload}, cost_hint=10)
 
-		client.execute(load_query("product_update"), {"product": payload}, cost_hint=10)
+			if pending:
+				if was in ("DRAFT", "ARCHIVED"):
+					publish_to_online_store(client, store, link.product_gid)
+				_mark_publish_decided(store, link.product_gid)
 
-		if pending:
-			if was in ("DRAFT", "ARCHIVED"):
-				publish_to_online_store(client, store, link.product_gid)
-			_mark_publish_decided(store, link.product_gid)
+			enqueue_media(store, item_code)
+		except Exception as exc:
+			# One row's fault is one row's fault. Letting it escape failed every other row in
+			# the claimed group -- including the ones after it, which were never attempted at
+			# all -- and nothing reconciles product, price or media, so those were simply lost
+			# until somebody found them in the dashboard.
+			failures[row["name"]] = exc
 
-		enqueue_media(store, item_code)
+	if failures:
+		raise PartialFailure(failures)
 
 
 def _product_is_dead(subject: str, item) -> bool:

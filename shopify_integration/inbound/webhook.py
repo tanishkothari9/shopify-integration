@@ -26,6 +26,7 @@ import hmac
 import json
 
 import frappe
+from frappe.utils import now_datetime
 
 #: Shopify's own cap is 20 MiB on some resources; anything near it is not a real webhook.
 #: Capping before hashing keeps a hostile caller from making us digest arbitrary megabytes.
@@ -174,6 +175,59 @@ def run_handler(event_log: str, handler: str):
 	"""
 	frappe.set_user("Administrator")
 	return frappe.get_attr(handler)(event_log=event_log)
+
+
+@frappe.whitelist()
+def retry_failed_events(limit: int = 50) -> int:
+	"""Scheduled sweep: re-run inbound handlers that failed and are due another go.
+
+	The outbound queue has retried since the beginning; the inbound side never did, so a
+	webhook that failed for any reason at all stayed failed until a person opened the log.
+	`reconcile_orders` only replays `orders/create`, so a dropped `orders/paid`,
+	`orders/fulfilled` or `refunds/create` was simply lost.
+
+	Bounded on both axes: `Shopify Event Log.MAX_ATTEMPTS` per event, and `limit` per sweep
+	so a backlog of failures cannot crowd out live traffic.
+	"""
+	from shopify_integration.shopify_integration.doctype.shopify_event_log.shopify_event_log import (
+		ShopifyEventLog,
+	)
+
+	due = frappe.get_all(
+		"Shopify Event Log",
+		filters={
+			"status": "Error",
+			"next_attempt_at": ["<=", now_datetime()],
+			"attempts": ["<", ShopifyEventLog.MAX_ATTEMPTS],
+		},
+		order_by="next_attempt_at asc",
+		limit=limit,
+		pluck="name",
+	)
+
+	queued = 0
+	for name in due:
+		log = frappe.get_doc("Shopify Event Log", name)
+		handler = TOPIC_HANDLERS.get(log.topic)
+		if not handler:
+			# Nothing to run it with. Stop considering it rather than asking every sweep.
+			log.db_set("next_attempt_at", None, update_modified=False)
+			continue
+
+		log.db_set({"status": "Queued", "next_attempt_at": None}, update_modified=False)
+		frappe.enqueue(
+			run_handler,
+			queue="default",
+			job_id=f"shopify_webhook_retry::{name}",
+			deduplicate=True,
+			enqueue_after_commit=True,
+			event_log=name,
+			handler=handler,
+		)
+		queued += 1
+
+	frappe.db.commit()
+	return queued
 
 
 def _log_event(*, store: str, webhook_id: str, topic: str, raw_body: bytes, status: str) -> str:

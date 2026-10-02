@@ -12,11 +12,15 @@ import frappe
 #: (doctype, columns, index name). Spec §5.5, §5.4.
 COMPOSITE_INDEXES = [
 	# The drain query: every claim pass filters on exactly these three columns, in this order.
+	# The claim query, in its exact order: store, state, then priority before creation.
+	("Shopify Sync Queue", ["store", "state", "priority", "next_attempt_at"], "sync_queue_claim"),
 	("Shopify Sync Queue", ["store", "state", "next_attempt_at"], "sync_queue_drain"),
 	# Supports the dashboard's per-store failure counts without scanning the table.
 	("Shopify Sync Queue", ["store", "operation", "state"], "sync_queue_store_op"),
 	# Event log lookups when replaying a store's history for support.
 	("Shopify Event Log", ["store", "topic", "status"], "event_log_store_topic"),
+	# The inbound retry sweep: failed events that are due another attempt.
+	("Shopify Event Log", ["status", "next_attempt_at"], "event_log_retry_due"),
 	# Resolving an order line's SKU to a mapping, per store.
 	("Shopify Item Link", ["store", "sku"], "item_link_store_sku"),
 	# The inventory delta query: "links whose watermark predates the bin's last change".

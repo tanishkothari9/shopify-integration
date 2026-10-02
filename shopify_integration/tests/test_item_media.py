@@ -508,13 +508,19 @@ class TestWhenShopifyCannotProcessIt(MediaCase):
 		client.media[0]["status"] = "FAILED"
 		client.media[0]["mediaErrors"] = [{"code": "IMAGE_PROCESSING_FAILURE", "message": "Corrupt file"}]
 
+		from shopify_integration.exceptions import PartialFailure
+
 		with (
 			patch.object(ShopifyClient, "for_store", return_value=client),
-			self.assertRaises(MediaSyncError) as caught,
+			self.assertRaises(PartialFailure) as caught,
 		):
-			push_media(self.store, [{"ref_docname": item}])
+			push_media(self.store, [{"name": "ROW-1", "ref_docname": item}])
 
-		self.assertIn("Corrupt file", str(caught.exception))
+		# Per row, so one product's bad image cannot fail every other product claimed with
+		# it -- and the engine writes each row's own exception to its own last_error.
+		failed = caught.exception.failures["ROW-1"]
+		self.assertIsInstance(failed, MediaSyncError)
+		self.assertIn("Corrupt file", str(failed))
 
 	def test_the_product_ceiling_is_respected(self):
 		item = self._item(image="/files/main.png")

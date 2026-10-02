@@ -34,6 +34,7 @@ import frappe
 from frappe.utils import cstr, flt
 
 from shopify_integration.api.client import ShopifyClient, load_query
+from shopify_integration.exceptions import PartialFailure
 from shopify_integration.outbound.price import current_price
 
 #: Products per membership mutation. Shopify accepts more, but a smaller call keeps one
@@ -122,9 +123,14 @@ def _mixed_variants_warning(item_code: str, resolved: dict[str, str | None]) -> 
 	)
 
 
-def enqueue_for_item(store: str, item_code: str) -> str | None:
-	"""Queue a collection check for one item. Cheap, and safe inside a user's save."""
-	from shopify_integration.sync.engine import enqueue_sync
+def enqueue_for_item(store: str, item_code: str, *, sweep: bool = False) -> str | None:
+	"""Queue a collection check for one item. Cheap, and safe inside a user's save.
+
+	`sweep` marks a row that may wait: a group-wide re-check queues thousands of these at
+	once, and they must not sit in front of the stock figure for something a customer is
+	buying right now.
+	"""
+	from shopify_integration.sync.engine import SWEEP_PRIORITY, enqueue_sync
 
 	store_doc = frappe.get_cached_doc("Shopify Store", store)
 	if not tax_collection_map(store_doc):
@@ -137,6 +143,7 @@ def enqueue_for_item(store: str, item_code: str) -> str | None:
 		ref_doctype="Item",
 		ref_docname=item_code,
 		payload={"item_code": item_code},
+		priority=SWEEP_PRIORITY if sweep else None,
 	)
 
 
@@ -256,7 +263,7 @@ def recheck_item_group(item_group: str) -> dict:
 
 	queued = 0
 	for row in published:
-		if enqueue_for_item(row.store, row.item_code):
+		if enqueue_for_item(row.store, row.item_code, sweep=True):
 			queued += 1
 
 	if queued:
@@ -307,10 +314,22 @@ def push_collections(store: str, rows: list[dict]) -> None:
 		return
 
 	client = ShopifyClient.for_store(store)
+	failures: dict[str, Exception] = {}
+
 	for row in rows:
-		item_code = _item_from(row)
-		if item_code:
-			sync_item_collections(client, store_doc, item_code)
+		try:
+			item_code = _item_from(row)
+			if item_code:
+				sync_item_collections(client, store_doc, item_code)
+		except Exception as exc:
+			# One row's fault is one row's fault. Letting it escape failed every other row in
+			# the claimed group -- including the ones after it, which were never attempted at
+			# all -- and nothing reconciles product, price or media, so those were simply lost
+			# until somebody found them in the dashboard.
+			failures[row["name"]] = exc
+
+	if failures:
+		raise PartialFailure(failures)
 
 
 def _item_from(row: dict) -> str | None:

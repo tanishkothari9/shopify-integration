@@ -5,7 +5,7 @@ from __future__ import annotations
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import now_datetime
+from frappe.utils import add_to_date, cint, now_datetime
 
 
 class ShopifyEventLog(Document):
@@ -27,8 +27,9 @@ class ShopifyEventLog(Document):
 		if not handler:
 			frappe.throw(_("No handler is registered for topic '{0}'.").format(self.topic))
 
-		self.db_set("status", "Queued")
-		self.db_set("traceback", None)
+		# A person asking for a retry is a fresh start: whatever they changed is the reason
+		# they are asking, so the automatic sweep gets its full run of attempts again.
+		self.db_set({"status": "Queued", "traceback": None, "attempts": 0, "next_attempt_at": None})
 		frappe.enqueue(
 			run_handler,
 			queue="default",
@@ -86,6 +87,33 @@ class ShopifyEventLog(Document):
 			}
 		)
 
+	#: How many times the scheduled sweep will re-run a failed handler before giving up.
+	#: Five is the queue's number too, and for the same reason: past that it is not a blip.
+	MAX_ATTEMPTS = 5
+
+	def due_again(self) -> None:
+		"""Schedule this failed event for another attempt, or stop trying.
+
+		Inbound handlers had no retry at all. A webhook that failed -- because a worker was
+		restarting, because a document was locked, because the order's `orders/paid` had not
+		landed yet -- sat in the log until a person noticed, and `reconcile_orders` only ever
+		replays `orders/create`. So every loud failure in this app was permanent, which is
+		what made each of them so much worse than the fault itself.
+		"""
+		from shopify_integration.sync.engine import backoff_seconds
+
+		attempts = cint(self.attempts) + 1
+		values = {"attempts": attempts}
+		if attempts < self.MAX_ATTEMPTS:
+			values["next_attempt_at"] = add_to_date(
+				now_datetime(), seconds=int(backoff_seconds(attempts)), as_datetime=True
+			)
+		else:
+			# Given up. Left Error with no next attempt, which is what the sweep skips and
+			# what the dashboard counts; the Retry button still works and starts it over.
+			values["next_attempt_at"] = None
+		self.db_set(values, update_modified=False)
+
 	def mark_error(self, traceback: str):
 		"""Record a failure so it survives the rollback that follows.
 
@@ -100,4 +128,5 @@ class ShopifyEventLog(Document):
 		"""
 		frappe.db.rollback()
 		self.db_set({"status": "Error", "processed_on": now_datetime(), "traceback": traceback})
+		self.due_again()
 		frappe.db.commit()

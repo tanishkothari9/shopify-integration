@@ -807,3 +807,266 @@ def _a_customer(name: str = "ZZ Audit Customer") -> str:
 		doc.insert(ignore_permissions=True)
 		frappe.db.commit()
 	return name
+
+
+class TestOneBadRowDoesNotFailTheRest(FrappeTestCase):
+	"""A drain claims up to fifty rows and hands them to one handler. When that handler
+	raised, every row in the group was marked failed -- including the ones after the fault,
+	which had never been attempted. Nothing reconciles product, price or media, so those
+	were lost until somebody found them in the dashboard.
+	"""
+
+	def test_only_the_failing_row_is_failed(self):
+		from shopify_integration.sync import engine
+
+		rows = [{"name": f"ROW-{n}", "operation": "product"} for n in range(1, 4)]
+		boom = RuntimeError("Shopify refused this one")
+
+		with (
+			patch.object(engine, "claim_rows", return_value=rows),
+			patch.object(engine, "_succeed") as succeeded,
+			patch.object(engine, "_handle_error", return_value="failed") as failed,
+			patch.object(
+				engine,
+				"OPERATION_HANDLERS",
+				{"product": "shopify_integration.tests.test_audit_fixes._raiser"},
+			),
+			patch.object(engine, "has_pending", return_value=False),
+			patch.object(engine.frappe, "get_attr", return_value=_partial_raiser({"ROW-2": boom})),
+		):
+			result = engine._drain_locked("ZZ Store", 50)
+
+		self.assertEqual(sorted(c[0][0] for c in succeeded.call_args_list), ["ROW-1", "ROW-3"])
+		self.assertEqual([c[0][0]["name"] for c in failed.call_args_list], ["ROW-2"])
+		self.assertEqual(result["done"], 2)
+
+	def test_each_row_is_failed_with_its_own_reason(self):
+		"""So the queue row's last_error says what actually happened to *that* product."""
+		from shopify_integration.sync import engine
+
+		rows = [{"name": "ROW-1", "operation": "product"}, {"name": "ROW-2", "operation": "product"}]
+		first, second = RuntimeError("no such variant"), RuntimeError("image rejected")
+
+		seen = {}
+		with (
+			patch.object(engine, "claim_rows", return_value=rows),
+			patch.object(engine, "_succeed"),
+			patch.object(
+				engine,
+				"_handle_error",
+				side_effect=lambda row, exc: (seen.__setitem__(row["name"], str(exc)), "failed")[1],
+			),
+			patch.object(engine, "OPERATION_HANDLERS", {"product": "x"}),
+			patch.object(engine, "has_pending", return_value=False),
+			patch.object(
+				engine.frappe, "get_attr", return_value=_partial_raiser({"ROW-1": first, "ROW-2": second})
+			),
+		):
+			engine._drain_locked("ZZ Store", 50)
+
+		self.assertEqual(seen, {"ROW-1": "no such variant", "ROW-2": "image rejected"})
+
+	def test_a_handler_that_breaks_outright_still_fails_everything(self):
+		"""A batched mutation, or a fault before any row was reached, is all-or-nothing."""
+		from shopify_integration.sync import engine
+
+		rows = [{"name": f"ROW-{n}", "operation": "inventory"} for n in range(1, 4)]
+
+		def explode(store, claimed):
+			raise RuntimeError("the whole call was refused")
+
+		with (
+			patch.object(engine, "claim_rows", return_value=rows),
+			patch.object(engine, "_succeed") as succeeded,
+			patch.object(engine, "_handle_error", return_value="failed") as failed,
+			patch.object(engine, "OPERATION_HANDLERS", {"inventory": "x"}),
+			patch.object(engine, "has_pending", return_value=False),
+			patch.object(engine.frappe, "get_attr", return_value=explode),
+		):
+			engine._drain_locked("ZZ Store", 50)
+
+		self.assertEqual(succeeded.call_count, 0)
+		self.assertEqual(failed.call_count, 3)
+
+	def test_the_row_handlers_isolate_their_rows(self):
+		import inspect
+
+		from shopify_integration.outbound import collections, media, product
+
+		for handler in (product.push_products, collections.push_collections, media.push_media):
+			source = inspect.getsource(handler)
+			self.assertIn("raise PartialFailure(failures)", source, handler.__name__)
+
+
+def _raiser(store, rows):
+	raise RuntimeError("unused")
+
+
+def _partial_raiser(failures):
+	from shopify_integration.exceptions import PartialFailure
+
+	def handler(store, rows):
+		raise PartialFailure(failures)
+
+	return handler
+
+
+class TestRealTimeStockIsNotParkedBehindASweep(FrappeTestCase):
+	"""Editing the tax rules on a big Item Group queues one collection row per published
+	product under it. On strict `creation ASC` every POS sale from that moment queued
+	behind thousands of them -- hours, on a real catalogue, for a figure that is supposed
+	to reach the storefront in seconds.
+	"""
+
+	def test_inventory_outranks_everything(self):
+		from shopify_integration.sync.engine import (
+			DEFAULT_PRIORITY,
+			PRIORITY_BY_OPERATION,
+			REALTIME_PRIORITY,
+			SWEEP_PRIORITY,
+		)
+
+		self.assertEqual(PRIORITY_BY_OPERATION["inventory"], REALTIME_PRIORITY)
+		self.assertLess(REALTIME_PRIORITY, DEFAULT_PRIORITY)
+		self.assertLess(DEFAULT_PRIORITY, SWEEP_PRIORITY)
+
+	def test_the_claim_takes_priority_before_age(self):
+		import inspect
+
+		from shopify_integration.sync import engine
+
+		self.assertIn("ORDER BY priority ASC, creation ASC", inspect.getsource(engine.claim_rows))
+
+	def test_a_group_wide_recheck_queues_rows_that_may_wait(self):
+		import inspect
+
+		from shopify_integration.outbound import collections
+
+		self.assertIn("sweep=True", inspect.getsource(collections.recheck_item_group))
+		self.assertIn("SWEEP_PRIORITY if sweep else None", inspect.getsource(collections.enqueue_for_item))
+
+	def test_an_ordinary_save_is_not_a_sweep(self):
+		"""One item changing group still has to reach Shopify promptly."""
+		import inspect
+
+		from shopify_integration.outbound import collections
+
+		self.assertNotIn("sweep=True", inspect.getsource(collections.on_item_change))
+
+
+class TestInboundFailuresAreRetried(FrappeTestCase):
+	"""The outbound queue has retried since the beginning; the inbound side never did. A
+	webhook that failed -- a restarting worker, a locked document, an `orders/paid` that
+	landed before its order -- sat in the log until a person noticed, and reconciliation
+	only ever replays `orders/create`.
+	"""
+
+	def _event(self, topic="orders/create", status="Error", attempts=0, due="2020-01-01 00:00:00"):
+		log = frappe.new_doc("Shopify Event Log")
+		log.store = frappe.get_all("Shopify Store", limit=1, pluck="name")[0]
+		log.topic = topic
+		log.webhook_id = f"zz-{frappe.generate_hash(length=10)}"
+		log.status = status
+		log.attempts = attempts
+		log.next_attempt_at = due
+		log.payload = "{}"
+		log.insert(ignore_permissions=True)
+		frappe.db.commit()
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(frappe.delete_doc, "Shopify Event Log", log.name, force=True, ignore_permissions=True)
+		return log
+
+	def test_a_failed_event_that_is_due_is_queued_again(self):
+		from shopify_integration.inbound.webhook import retry_failed_events
+
+		log = self._event()
+		with patch("shopify_integration.inbound.webhook.frappe.enqueue") as enqueued:
+			retry_failed_events()
+
+		self.assertIn(log.name, [c.kwargs.get("event_log") for c in enqueued.call_args_list])
+		self.assertEqual(frappe.db.get_value("Shopify Event Log", log.name, "status"), "Queued")
+
+	def test_one_not_yet_due_is_left_alone(self):
+		from shopify_integration.inbound.webhook import retry_failed_events
+
+		log = self._event(due="2099-01-01 00:00:00")
+		with patch("shopify_integration.inbound.webhook.frappe.enqueue") as enqueued:
+			retry_failed_events()
+
+		self.assertNotIn(log.name, [c.kwargs.get("event_log") for c in enqueued.call_args_list])
+
+	def test_it_gives_up_after_enough_attempts(self):
+		"""A permanently broken event must not be retried for ever."""
+		from shopify_integration.inbound.webhook import retry_failed_events
+		from shopify_integration.shopify_integration.doctype.shopify_event_log.shopify_event_log import (
+			ShopifyEventLog,
+		)
+
+		log = self._event(attempts=ShopifyEventLog.MAX_ATTEMPTS)
+		with patch("shopify_integration.inbound.webhook.frappe.enqueue") as enqueued:
+			retry_failed_events()
+
+		self.assertNotIn(log.name, [c.kwargs.get("event_log") for c in enqueued.call_args_list])
+
+	def test_a_successful_event_is_never_retried(self):
+		from shopify_integration.inbound.webhook import retry_failed_events
+
+		log = self._event(status="Success")
+		with patch("shopify_integration.inbound.webhook.frappe.enqueue") as enqueued:
+			retry_failed_events()
+
+		self.assertNotIn(log.name, [c.kwargs.get("event_log") for c in enqueued.call_args_list])
+
+	def test_a_topic_with_no_handler_stops_being_considered(self):
+		from shopify_integration.inbound.webhook import retry_failed_events
+
+		log = self._event(topic="zz/nonsense")
+		with patch("shopify_integration.inbound.webhook.frappe.enqueue"):
+			retry_failed_events()
+
+		self.assertIsNone(frappe.db.get_value("Shopify Event Log", log.name, "next_attempt_at"))
+
+	def test_failing_schedules_the_next_attempt_with_backoff(self):
+		log = self._event(status="Queued", attempts=0, due=None)
+		log.mark_error("boom")
+
+		row = frappe.db.get_value(
+			"Shopify Event Log", log.name, ["status", "attempts", "next_attempt_at"], as_dict=True
+		)
+		self.assertEqual(row.status, "Error")
+		self.assertEqual(row.attempts, 1)
+		self.assertIsNotNone(row.next_attempt_at, "a first failure has to come round again")
+
+	def test_the_last_attempt_stops_scheduling(self):
+		from shopify_integration.shopify_integration.doctype.shopify_event_log.shopify_event_log import (
+			ShopifyEventLog,
+		)
+
+		log = self._event(status="Queued", attempts=ShopifyEventLog.MAX_ATTEMPTS - 1)
+		log.mark_error("boom")
+
+		self.assertIsNone(frappe.db.get_value("Shopify Event Log", log.name, "next_attempt_at"))
+
+	def test_a_person_pressing_retry_starts_the_count_over(self):
+		"""They changed something; that is why they are asking."""
+		from shopify_integration.shopify_integration.doctype.shopify_event_log.shopify_event_log import (
+			ShopifyEventLog,
+		)
+
+		log = self._event(attempts=ShopifyEventLog.MAX_ATTEMPTS)
+		with patch(
+			"shopify_integration.shopify_integration.doctype.shopify_event_log.shopify_event_log.frappe.enqueue"
+		):
+			frappe.get_doc("Shopify Event Log", log.name).retry()
+
+		self.assertEqual(frappe.db.get_value("Shopify Event Log", log.name, "attempts"), 0)
+
+	def test_the_sweep_is_scheduled(self):
+		cron = frappe.get_hooks("scheduler_events").get("cron") or {}
+		self.assertTrue(
+			any(
+				"shopify_integration.inbound.webhook.retry_failed_events" in methods
+				for methods in cron.values()
+			),
+			"nothing retries inbound failures unless this is on the scheduler",
+		)

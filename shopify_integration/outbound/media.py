@@ -22,6 +22,7 @@ import frappe
 from frappe.utils import cstr, get_url
 
 from shopify_integration.api.client import ShopifyClient, load_query
+from shopify_integration.exceptions import PartialFailure
 
 #: What Shopify will take as a product image. Anything else attached to the Item -- a PDF
 #: size chart, a supplier's invoice -- is not a photograph and is left alone.
@@ -423,18 +424,25 @@ def push_media(store: str, rows: list[dict]) -> None:
 
 	client = ShopifyClient.for_store(store)
 
-	failures = []
+	# Per row, so one product whose images Shopify will not take cannot fail the images of
+	# every other product claimed alongside it.
+	failures: dict[str, Exception] = {}
 	for row in rows:
 		item_code = cstr(row.get("ref_docname"))
 		if not item_code or not frappe.db.exists("Item", item_code):
 			continue
-		failures.extend(sync_item_media(client, store_doc, item_code).get("failures") or [])
+		try:
+			reported = sync_item_media(client, store_doc, item_code).get("failures") or []
+			if reported:
+				raise MediaSyncError("\n".join(reported))
+		except Exception as exc:
+			failures[row["name"]] = exc
 
 	if failures:
 		# Everything that did work is already written. Raising afterwards is what puts the
 		# reason somewhere a person will see it -- on the queue row, in plain words.
 		frappe.db.commit()
-		raise MediaSyncError("\n".join(failures))
+		raise PartialFailure(failures)
 
 
 def enqueue_media(store: str, item_code: str) -> str | None:

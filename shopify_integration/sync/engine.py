@@ -24,6 +24,8 @@ import frappe
 from frappe.utils import get_site_path, now_datetime
 from frappe.utils.file_lock import LockTimeoutError
 
+from shopify_integration.exceptions import PartialFailure
+
 #: Rows claimed per drain pass. Bounded so one store's backlog cannot monopolise a worker.
 DEFAULT_BATCH_SIZE = 50
 
@@ -36,6 +38,21 @@ STALE_RUNNING_MINUTES = 15
 
 #: Operation -> dotted path of callable(store, rows). Handlers receive the whole group so
 #: they can batch into one mutation, which is the entire point of moving off REST.
+#: Lower drains first. Inventory is the only thing a customer can be hurt by waiting for:
+#: everything else is a listing that is briefly stale, but stale availability oversells.
+#:
+#: Strict `creation ASC` is what made this necessary. Editing the tax rules on an Item Group
+#: queues one collection row per published product under it -- thousands on a real
+#: catalogue -- and at roughly two API calls each that is hours of work. Every POS sale from
+#: that moment queued behind it, so the "stock reaches Shopify in seconds" guarantee became
+#: a three-hour delay. The throttle's floor reserves API *budget* for exactly this case and
+#: could do nothing about claim order.
+DEFAULT_PRIORITY = 1
+REALTIME_PRIORITY = 0
+SWEEP_PRIORITY = 2
+
+PRIORITY_BY_OPERATION: dict[str, int] = {"inventory": REALTIME_PRIORITY}
+
 OPERATION_HANDLERS: dict[str, str] = {
 	"inventory": "shopify_integration.outbound.inventory.push_inventory",
 	"product": "shopify_integration.outbound.product.push_products",
@@ -53,6 +70,7 @@ def enqueue_sync(
 	ref_doctype: str | None = None,
 	ref_docname: str | None = None,
 	payload: dict | None = None,
+	priority: int | None = None,
 ) -> str | None:
 	"""Insert a Pending row unless one already exists for this dedupe_key, then schedule a drain.
 
@@ -68,6 +86,9 @@ def enqueue_sync(
 	doc.ref_doctype = ref_doctype
 	doc.ref_docname = ref_docname
 	doc.state = "Pending"
+	doc.priority = (
+		priority if priority is not None else PRIORITY_BY_OPERATION.get(operation, DEFAULT_PRIORITY)
+	)
 	doc.attempts = 0
 	doc.next_attempt_at = now_datetime()
 	if payload:
@@ -186,18 +207,25 @@ def _drain_locked(store: str, batch_size: int) -> dict:
 				result["failed"] += 1
 			continue
 
+		failures: dict[str, Exception] = {}
 		try:
 			handler = frappe.get_attr(handler_path)
 			handler(store, rows)
+		except PartialFailure as partial:
+			# The handler worked row by row and told us exactly which ones broke. The rest
+			# were pushed and are done.
+			failures = partial.failures
 		except Exception as exc:
-			for row in rows:
-				outcome = _handle_error(row, exc)
-				result[outcome] += 1
-			continue
+			# Batched, or broken before it got to any particular row. The whole group fails.
+			failures = {row["name"]: exc for row in rows}
 
 		for row in rows:
-			_succeed(row["name"])
-			result["done"] += 1
+			exc = failures.get(row["name"])
+			if exc is None:
+				_succeed(row["name"])
+				result["done"] += 1
+			else:
+				result[_handle_error(row, exc)] += 1
 
 	frappe.db.commit()
 	return result
@@ -219,7 +247,7 @@ def claim_rows(store: str, batch_size: int) -> list[dict]:
 		WHERE store = %(store)s
 		  AND state = 'Pending'
 		  AND (next_attempt_at IS NULL OR next_attempt_at <= %(now)s)
-		ORDER BY creation ASC
+		ORDER BY priority ASC, creation ASC
 		LIMIT %(limit)s
 		FOR UPDATE SKIP LOCKED
 		""",

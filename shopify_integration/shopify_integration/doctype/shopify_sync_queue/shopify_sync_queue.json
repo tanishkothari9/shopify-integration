@@ -11,6 +11,7 @@
   "dedupe_key",
   "pending_dedupe_key",
   "column_break_1",
+  "priority",
   "state",
   "attempts",
   "next_attempt_at",
@@ -124,6 +125,14 @@
    "fieldtype": "Long Text",
    "label": "Last Error",
    "read_only": 1
+  },
+  {
+   "fieldname": "priority",
+   "fieldtype": "Int",
+   "label": "Priority",
+   "default": "1",
+   "read_only": 1,
+   "description": "Lower drains first. 0 is real-time stock, 1 is ordinary work, 2 is a bulk sweep that may wait."
   }
  ],
  "index_web_pages_for_search": 1,

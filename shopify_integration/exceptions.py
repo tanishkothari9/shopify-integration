@@ -89,3 +89,17 @@ class WebhookVerificationError(ShopifyError):
 	"""HMAC did not verify, or the shop domain is unknown. Never process the payload."""
 
 	retryable = False
+
+
+class PartialFailure(Exception):
+	"""Some rows of a claimed drain group failed and the rest did not.
+
+	A handler that works row by row raises this instead of letting one row's exception
+	escape. Without it the engine has no way to tell which row broke, so it fails the whole
+	group -- including rows it never attempted -- and for `product`, `price` and `media`
+	there is no reconciliation that would ever pick them up again.
+	"""
+
+	def __init__(self, failures: dict[str, Exception]):
+		self.failures = failures
+		super().__init__(f"{len(failures)} of the claimed rows failed")

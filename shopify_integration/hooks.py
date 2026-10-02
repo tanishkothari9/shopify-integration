@@ -24,6 +24,10 @@ scheduler_events = {
 		# Re-poll bulk operations whose poll job was lost, so an import cannot stall at
 		# Running forever with its results never applied.
 		"*/5 * * * *": ["shopify_integration.api.bulk.poll_running_operations"],
+		# Re-run inbound handlers that failed and are due another attempt. The outbound queue
+		# has always retried; the inbound side never did, so a webhook that failed for any
+		# reason at all stayed failed until a person opened the log.
+		"*/2 * * * *": ["shopify_integration.inbound.webhook.retry_failed_events"],
 		# Nightly drift check. Not a safety net like the others but a feature in its own
 		# right: it is what lets an operator trust the integration rather than watch it.
 		"0 3 * * *": ["shopify_integration.sync.reconcile.reconcile_all_stores"],
