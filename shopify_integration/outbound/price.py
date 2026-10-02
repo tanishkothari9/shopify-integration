@@ -13,7 +13,7 @@ every change would send Shopify a wholesale price the moment someone edited it.
 from __future__ import annotations
 
 import frappe
-from frappe.utils import cstr, flt
+from frappe.utils import cstr, flt, nowdate
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import is_echo
@@ -182,19 +182,51 @@ def current_price(store_doc, item_code: str):
 	there, just on another list, and nothing says so.
 	"""
 	price_list = store_doc.selling_price_list or f"Shopify - {store_doc.name}"[:140]
-	value = frappe.db.get_value(
-		"Item Price",
-		{"item_code": item_code, "price_list": price_list, "selling": 1},
-		"price_list_rate",
-	)
-	if value not in (None, ""):
-		return from_document(flt(value))
+	value = _retail_rate(item_code, price_list)
+	if value is not None:
+		return from_document(value)
 
 	standard = frappe.db.get_value("Item", item_code, "standard_rate")
 	if standard and flt(standard) > 0:
 		return from_document(flt(standard))
 
 	return None
+
+
+def _retail_rate(item_code: str, price_list: str):
+	"""The one rate a walk-up customer would be charged today, or None.
+
+	ERPNext allows many Item Price rows for the same item and price list, differing by
+	validity dates, UOM, minimum quantity or customer. `get_value` returns whichever the
+	database hands back first, so a lapsed festival rate, a wholesale break or one
+	customer's negotiated price could be published to the storefront as the retail price.
+
+	The conditions mirror ERPNext's own `get_item_price`: no party-specific row, no batch,
+	in date, in the stock UOM, and no quantity break (`packing_unit`, which is ERPNext's
+	name for it). Ordered newest-valid-first, so of two equally valid rows the later one
+	wins -- which is what ERPNext itself does.
+	"""
+	rows = frappe.db.sql(
+		"""
+		SELECT price_list_rate
+		FROM `tabItem Price`
+		WHERE item_code = %(item_code)s
+		  AND price_list = %(price_list)s
+		  AND selling = 1
+		  AND IFNULL(customer, '') = ''
+		  AND IFNULL(uom, '') IN ('', IFNULL((SELECT stock_uom FROM `tabItem` WHERE name = %(item_code)s), ''))
+		  AND IFNULL(packing_unit, 0) IN (0, 1)
+		  AND IFNULL(batch_no, '') = ''
+		  AND IFNULL(valid_from, '2000-01-01') <= %(today)s
+		  AND IFNULL(valid_upto, '2500-12-31') >= %(today)s
+		ORDER BY IFNULL(valid_from, '2000-01-01') DESC, IFNULL(uom, '') DESC, modified DESC
+		LIMIT 1
+		""",
+		{"item_code": item_code, "price_list": price_list, "today": nowdate()},
+	)
+	if not rows or rows[0][0] in (None, ""):
+		return None
+	return flt(rows[0][0])
 
 
 def _stamp_synced(link_names: list[str]) -> None:

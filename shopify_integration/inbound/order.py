@@ -36,12 +36,21 @@ from shopify_integration.utils.taxes import (
 	net_shipping_total,
 	shipping_tax_template,
 	shipping_titles,
+	shipping_total,
 	unit_rate,
 )
 from shopify_integration.utils.timestamps import shopify_date, shopify_time
 
 #: Shopify financial statuses that mean money has actually arrived.
-PAID_STATUSES = ("PAID", "PARTIALLY_PAID")
+#:
+#: The refunded ones belong here: a refund is only possible because the customer paid, and
+#: `totalOutstandingSet` still reports nothing owing. Leaving them out meant a replayed
+#: `orders/paid` -- which is exactly what the credit-note handler's own error message tells
+#: an operator to do -- submitted the full invoice and silently created no Payment Entry,
+#: then reported Success. The customer then showed as owing money they had already paid, and
+#: the refund, when it was retried, paid that money out of the bank a second time. The
+#: reversal of a refunded payment is the refund handler's job, not this one's.
+PAID_STATUSES = ("PAID", "PARTIALLY_PAID", "PARTIALLY_REFUNDED", "REFUNDED")
 
 
 # --------------------------------------------------------------------------------------
@@ -138,15 +147,35 @@ def on_order_cancelled(event_log: str):
 				log.mark_skipped("order already fully refunded and closed in ERPNext; nothing to cancel")
 				return {"skipped": "already fully refunded and closed", "sales_order": closed}
 
-			# Closed, but the money is still held. Nobody should guess at this one.
-			frappe.throw(
-				_(
-					"Shopify order {0} was cancelled, but Sales Order {1} is Closed in ERPNext "
-					"and its invoice has not been credited back. Someone closed it by hand while "
-					"the customer's money is still held. Re-open the Sales Order and replay this "
-					"webhook, or refund the invoice, depending on what actually happened."
-				).format(order.get("name") if order else gid, closed)
-			)
+			if _closed_by_refund(log.store, gid):
+				# Closed by `settle_after_refund`, not by a person: it closes an order as soon
+				# as nothing is still owed, which does not require the *money* to be fully
+				# refunded. Cancelling an order after refunding the goods but not the shipping
+				# -- the default in Shopify's own refund dialog -- landed exactly here and
+				# threw, blaming a human for the integration's own work, and a retry failed
+				# identically. Re-open it so ERPNext will allow the cancellation, which it
+				# refuses outright on a Closed order.
+				with inbound_write():
+					sales_order = frappe.get_doc("Sales Order", closed)
+					mark(sales_order)
+					# "Draft" is ERPNext's own word for re-open -- `update_status` recomputes
+					# the real status from what has been delivered and billed. It is what the
+					# Re-open button in the Sales Order form sends.
+					sales_order.update_status("Draft")
+				frappe.db.commit()
+
+			else:
+				# Closed, the money is still held, and no refund of ours explains it. Nobody
+				# should guess at this one.
+				frappe.throw(
+					_(
+						"Shopify order {0} was cancelled, but Sales Order {1} is Closed in "
+						"ERPNext and its invoice has not been credited back. Someone closed it "
+						"by hand while the customer's money is still held. Re-open the Sales "
+						"Order and replay this webhook, or refund the invoice, depending on "
+						"what actually happened."
+					).format(order.get("name") if order else gid, closed)
+				)
 
 		cancelled = cancel_linked_documents(log.store, gid)
 		frappe.db.commit()
@@ -471,7 +500,19 @@ def _add_line_items(doc, store_doc, order: dict, side: str) -> None:
 def _add_charges(doc, store_doc, order: dict, side: str) -> None:
 	"""Shipping and tax rows. Shipping is a line item or a charge, per store config."""
 	taxes_included = bool(order.get("taxesIncluded"))
-	shipping = net_shipping_total(order, side, taxes_included)
+
+	# A line item is booked gross, exactly like the goods are -- on a tax-inclusive invoice
+	# ERPNext backs the tax out of every line itself, using that line's own Item Tax
+	# Template. Booking the *net* figure here, as this did, had the tax removed twice: the
+	# line contributed 100 to an order where the customer paid 118, `assert_total_matches`
+	# found the order short, and nothing imported at all -- every order on a tax-inclusive
+	# store with a Shipping Item. A charge row is different: it is booked net with its own
+	# Actual tax row beside it, which is what `net_shipping_total` is for.
+	if store_doc.shipping_item:
+		shipping = shipping_total(order, side)
+	else:
+		shipping = net_shipping_total(order, side, taxes_included)
+
 	if shipping and store_doc.shipping_item:
 		row = {
 			"item_code": store_doc.shipping_item,
@@ -806,6 +847,27 @@ def _closed_sales_order(store: str, order_gid: str | None) -> str | None:
 	if not name:
 		return None
 	return name if frappe.db.get_value("Sales Order", name, "status") == "Closed" else None
+
+
+def _closed_by_refund(store: str, order_gid: str | None) -> bool:
+	"""Whether this app closed the Sales Order because a refund settled it.
+
+	`settle_after_refund` closes an order the moment nothing is still owed, which happens
+	long before the money is all back -- refund the goods and keep the shipping, and the
+	order is Closed with a balance outstanding. A credit note against the order is the
+	evidence that the closure was ours.
+	"""
+	return bool(
+		frappe.db.exists(
+			"Sales Invoice",
+			{
+				"shopify_store": store,
+				"shopify_order_gid": order_gid,
+				"is_return": 1,
+				"docstatus": 1,
+			},
+		)
+	)
 
 
 def _fully_refunded(store: str, order_gid: str | None) -> bool:

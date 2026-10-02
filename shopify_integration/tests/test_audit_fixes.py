@@ -522,3 +522,288 @@ class TestTheCompareIsAllOrNothing(FrappeTestCase):
 		self.assertEqual(len(sent), 1)
 		self.assertTrue(sent[0]["ignoreCompareQuantity"])
 		self.assertEqual(len(sent[0]["quantities"]), 2)
+
+
+class TestShippingAsAnItem(FrappeTestCase):
+	"""A store that books postage as a Shipping Item rather than a charge row -- which is
+	what `utils/taxes.py` tells an india_compliance store to do, so that freight carries its
+	own tax template like any other line.
+
+	On a tax-inclusive store that configuration imported nothing at all. Every other line is
+	booked gross and ERPNext backs the tax out of it; the shipping line was booked net, so
+	its tax came off twice, the order came up short against what the customer paid, and
+	`assert_total_matches` refused it. No test in the suite set a Shipping Item, so the
+	whole configuration was uncovered.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import SECRET_A, make_store, with_hsn
+
+		cls.store = make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
+
+		if not frappe.db.exists("Item", "ZZ-FREIGHT"):
+			item = frappe.new_doc("Item")
+			item.item_code = "ZZ-FREIGHT"
+			item.item_name = "Delivery"
+			item.item_group = frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0]
+			item.stock_uom = "Nos"
+			item.is_stock_item = 0
+			with_hsn(item)
+			item.insert(ignore_permissions=True)
+			frappe.db.commit()
+
+	def setUp(self):
+		from shopify_integration.tests.test_orders import OrderTestCase
+
+		# Reuse the order fixture's store wiring -- company, warehouse, tax map and the
+		# ORD-TEE item its payloads refer to -- then add the Shipping Item on top.
+		OrderTestCase.setUpClass()
+		self.store_doc = frappe.get_doc("Shopify Store", OrderTestCase.store)
+		self.store_doc.shipping_item = "ZZ-FREIGHT"
+		self.store_doc.flags.ignore_mandatory = True
+		self.store_doc.save(ignore_permissions=True)
+		frappe.db.commit()
+		self.addCleanup(self._unset_shipping_item)
+		self.variant_gid = OrderTestCase.variant_gid
+
+	def _unset_shipping_item(self):
+		frappe.db.set_value("Shopify Store", self.store_doc.name, "shipping_item", None)
+		frappe.clear_document_cache("Shopify Store", self.store_doc.name)
+		frappe.db.commit()
+
+	def _order(self, **kwargs):
+		from shopify_integration.tests.test_orders import build_order
+
+		kwargs.setdefault("variant_gid", self.variant_gid)
+		return build_order(**kwargs)
+
+	def test_a_tax_inclusive_order_with_shipping_imports(self):
+		"""The regression. 100 of goods and 118 of postage, both tax-inclusive: the customer
+		paid 218 and the order has to book 218."""
+		from shopify_integration.inbound import order as order_module
+
+		payload = self._order(
+			gid=f"gid://shopify/Order/{frappe.generate_hash(length=8)}",
+			qty=1,
+			unit_price="100.00",
+			tax="15.25",
+			shipping="118.00",
+			shipping_tax="18.00",
+			taxes_included=True,
+			total="218.00",
+		)
+		so = frappe.get_doc("Sales Order", order_module.create_sales_order(self.store_doc, payload))
+
+		self.assertAlmostEqual(so.grand_total, 218.00, places=2)
+		freight = next(row for row in so.items if row.item_code == "ZZ-FREIGHT")
+		self.assertAlmostEqual(
+			freight.rate, 118.00, places=2, msg="the postage line is gross, like every other line"
+		)
+
+	def test_a_tax_exclusive_order_with_shipping_still_imports(self):
+		"""The configuration that already worked has to keep working."""
+		from shopify_integration.inbound import order as order_module
+
+		payload = self._order(
+			gid=f"gid://shopify/Order/{frappe.generate_hash(length=8)}",
+			qty=1,
+			unit_price="100.00",
+			tax="10.00",
+			shipping="20.00",
+			shipping_tax="2.00",
+			taxes_included=False,
+			total="132.00",
+		)
+		so = frappe.get_doc("Sales Order", order_module.create_sales_order(self.store_doc, payload))
+
+		self.assertAlmostEqual(so.grand_total, 132.00, places=2)
+		freight = next(row for row in so.items if row.item_code == "ZZ-FREIGHT")
+		self.assertAlmostEqual(freight.rate, 20.00, places=2, msg="net, with its tax added on top")
+
+	def test_the_shipping_item_is_credited_on_a_refund(self):
+		"""Refunded postage is a credit line on a store that books it as an Item. It used to
+		be looked for among the invoice's charge rows, where there is none -- so the note
+		came up short and the whole refund was thrown away, not just the postage."""
+		from shopify_integration.inbound import refund as refund_module
+
+		quantities = {"ORD-TEE": {"qty": 1, "restock": False, "tax": 0, "amount": 0}}
+		refund = {
+			"id": "gid://shopify/Refund/ship-1",
+			"refundShippingLines": {
+				"nodes": [{"subtotalAmountSet": _bag("20.00"), "taxAmountSet": _bag("2.00")}]
+			},
+		}
+		credit_note = frappe._dict({"taxes": []})  # exclusive: no included_in_print_rate rows
+
+		with_shipping = refund_module._with_refunded_shipping(
+			self.store_doc, credit_note, refund, quantities, "shopMoney"
+		)
+
+		self.assertIn("ZZ-FREIGHT", with_shipping)
+		entry = with_shipping["ZZ-FREIGHT"]
+		self.assertEqual(entry["qty"], 1)
+		self.assertEqual(float(entry["rate"]), 20.00, "net, because the invoice was exclusive")
+		self.assertEqual(entry["tax"], 0, "the shipping tax is added by the tax rows, not twice")
+
+	def test_an_inclusive_credit_note_carries_the_postage_gross(self):
+		from shopify_integration.inbound import refund as refund_module
+
+		refund = {
+			"id": "gid://shopify/Refund/ship-2",
+			"refundShippingLines": {
+				"nodes": [{"subtotalAmountSet": _bag("100.00"), "taxAmountSet": _bag("18.00")}]
+			},
+		}
+		inclusive_note = frappe._dict(
+			{"taxes": [frappe._dict({"charge_type": "On Net Total", "included_in_print_rate": 1})]}
+		)
+
+		with_shipping = refund_module._with_refunded_shipping(
+			self.store_doc, inclusive_note, refund, {}, "shopMoney"
+		)
+
+		self.assertEqual(float(with_shipping["ZZ-FREIGHT"]["rate"]), 118.00)
+
+	def test_a_refund_with_no_postage_adds_no_line(self):
+		from shopify_integration.inbound import refund as refund_module
+
+		self.assertEqual(
+			refund_module._with_refunded_shipping(
+				self.store_doc, frappe._dict({"taxes": []}), {"id": "r"}, {"ORD-TEE": {}}, "shopMoney"
+			),
+			{"ORD-TEE": {}},
+		)
+
+	def test_a_store_without_a_shipping_item_is_unchanged(self):
+		from shopify_integration.inbound import refund as refund_module
+
+		plain = frappe._dict({"shipping_item": None})
+		refund = {
+			"id": "r",
+			"refundShippingLines": {
+				"nodes": [{"subtotalAmountSet": _bag("20.00"), "taxAmountSet": _bag("2.00")}]
+			},
+		}
+		self.assertEqual(
+			refund_module._with_refunded_shipping(
+				plain, frappe._dict({"taxes": []}), refund, {}, "shopMoney"
+			),
+			{},
+		)
+
+
+def _bag(amount: str) -> dict:
+	return {"shopMoney": {"amount": amount}, "presentmentMoney": {"amount": amount}}
+
+
+class TestPickingTheRetailPrice(FrappeTestCase):
+	"""ERPNext allows many Item Price rows for one item and price list, differing by
+	validity dates, UOM, quantity break or customer. The old lookup took whichever the
+	database returned first, so a lapsed festival rate, a wholesale break or one customer's
+	negotiated price could be published to the storefront as the retail price.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import with_hsn
+
+		cls.price_list = "ZZ Audit Retail"
+		if not frappe.db.exists("Price List", cls.price_list):
+			doc = frappe.new_doc("Price List")
+			doc.price_list_name = cls.price_list
+			doc.selling = 1
+			doc.currency = frappe.defaults.get_global_default("currency") or "INR"
+			doc.insert(ignore_permissions=True)
+
+		cls.item = "ZZ-PRICED"
+		if not frappe.db.exists("Item", cls.item):
+			item = frappe.new_doc("Item")
+			item.item_code = cls.item
+			item.item_name = cls.item
+			item.item_group = frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0]
+			item.stock_uom = "Nos"
+			with_hsn(item)
+			item.insert(ignore_permissions=True)
+		# No Standard Selling Rate: `current_price` falls back to it, which would mask a
+		# lookup that found nothing.
+		frappe.db.set_value("Item", cls.item, "standard_rate", 0)
+		frappe.db.commit()
+
+	def setUp(self):
+		frappe.db.delete("Item Price", {"item_code": self.item})
+		frappe.db.commit()
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(frappe.db.delete, "Item Price", {"item_code": self.item})
+
+	def _price(self, rate, **kwargs):
+		doc = frappe.new_doc("Item Price")
+		doc.item_code = self.item
+		doc.price_list = self.price_list
+		doc.selling = 1
+		doc.price_list_rate = rate
+		for field, value in kwargs.items():
+			setattr(doc, field, value)
+		doc.insert(ignore_permissions=True)
+		frappe.db.commit()
+		return doc
+
+	def _rate(self):
+		"""Through `current_price`, which is what the catalogue actually calls -- testing the
+		helper alone would pass against a version that never calls it."""
+		from shopify_integration.outbound.price import current_price
+
+		store_doc = frappe._dict({"name": "ZZ Audit", "selling_price_list": self.price_list})
+		price = current_price(store_doc, self.item)
+		return None if price is None else float(price)
+
+	def test_the_plain_rate_is_used(self):
+		self._price(1200)
+		self.assertEqual(self._rate(), 1200)
+
+	def test_a_lapsed_rate_is_not_used(self):
+		self._price(1200)
+		self._price(600, valid_from="2020-01-01", valid_upto="2020-12-31")
+		self.assertEqual(self._rate(), 1200, "a festival price that ended in 2020 is not today's price")
+
+	def test_a_rate_that_has_not_started_is_not_used(self):
+		self._price(1200)
+		self._price(900, valid_from="2099-01-01")
+		self.assertEqual(self._rate(), 1200)
+
+	def test_a_wholesale_break_is_not_the_retail_price(self):
+		self._price(1200)
+		self._price(800, packing_unit=50)
+		self.assertEqual(self._rate(), 1200, "a price for 50 at a time is not what one costs")
+
+	def test_one_customers_negotiated_price_is_not_published(self):
+		customer = _a_customer()
+		self._price(1200)
+		self._price(700, customer=customer)
+		self.assertEqual(self._rate(), 1200)
+
+	def test_the_most_recently_valid_of_two_live_rates_wins(self):
+		"""Deterministic, and the same choice ERPNext itself makes."""
+		self._price(1200, valid_from="2026-01-01")
+		self._price(1100, valid_from="2026-06-01")
+		self.assertEqual(self._rate(), 1100)
+
+	def test_no_usable_row_is_none(self):
+		self._price(800, packing_unit=50)
+		self.assertIsNone(self._rate(), "a quantity break alone is not a retail price")
+
+
+def _a_customer(name: str = "ZZ Audit Customer") -> str:
+	if not frappe.db.exists("Customer", name):
+		doc = frappe.new_doc("Customer")
+		doc.customer_name = name
+		doc.customer_type = "Individual"
+		doc.customer_group = frappe.get_all("Customer Group", filters={"is_group": 0}, limit=1, pluck="name")[
+			0
+		]
+		doc.territory = frappe.get_all("Territory", filters={"is_group": 0}, limit=1, pluck="name")[0]
+		doc.insert(ignore_permissions=True)
+		frappe.db.commit()
+	return name

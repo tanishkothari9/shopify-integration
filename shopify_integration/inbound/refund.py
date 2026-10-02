@@ -539,6 +539,13 @@ def _build_return_invoice(store_doc, refund: dict, invoice_name: str, quantities
 		if store_doc.credit_note_series:
 			credit_note.naming_series = store_doc.credit_note_series
 
+		# On a store that books shipping as an Item, refunded shipping is a credit *line*,
+		# not a charge row -- there is no shipping charge on the invoice to reverse. Without
+		# this the refunded shipping was left out of the note entirely, the note came up
+		# short against the refund, and `_assert_credit_matches` threw away the whole refund
+		# rather than just the shipping part of it.
+		quantities = _with_refunded_shipping(store_doc, credit_note, refund, quantities, side)
+
 		# Drawn down per row: an item sitting on two invoice lines would otherwise be credited
 		# its whole refunded quantity twice over.
 		remaining = {code: entry["qty"] for code, entry in quantities.items()}
@@ -555,6 +562,11 @@ def _build_return_invoice(store_doc, refund: dict, invoice_name: str, quantities
 			remaining[row.item_code] = wanted - taken
 			row.qty = -taken
 			row.stock_qty = row.qty * (row.conversion_factor or 1)
+			# Only shipping sets this: a partial refund of the postage credits what was
+			# actually given back, not the whole original charge.
+			override = (quantities.get(row.item_code) or {}).get("rate")
+			if override is not None:
+				row.rate = to_float(quantize(override))
 			kept.append(row)
 
 		if not kept:
@@ -632,6 +644,40 @@ def _refunded_nothing(refund: dict) -> bool:
 	return True
 
 
+def _with_refunded_shipping(store_doc, credit_note, refund: dict, quantities: dict, side: str) -> dict:
+	"""Add the store's Shipping Item to the refunded lines, when postage was refunded.
+
+	Gross or net to match the invoice: a tax-inclusive invoice carries every line gross and
+	lets ERPNext back the tax out, so the shipping line has to be gross there too.
+	"""
+	if not store_doc.shipping_item:
+		return quantities
+
+	amount = ZERO
+	tax = ZERO
+	for node in (refund.get("refundShippingLines") or {}).get("nodes") or []:
+		amount += money_field(node, "subtotalAmountSet", side)
+		tax += money_field(node, "taxAmountSet", side)
+
+	if amount == ZERO and tax == ZERO:
+		return quantities
+
+	inclusive = _is_inclusive(list(credit_note.get("taxes") or []))
+	return {
+		**quantities,
+		# tax stays ZERO: `_apply_refund_taxes` reads the shipping tax from the refund
+		# itself, and counting it here as well would credit it twice.
+		store_doc.shipping_item: {
+			"qty": 1,
+			"restock": False,
+			"tax": ZERO,
+			"amount": amount,
+			"location_gid": None,
+			"rate": amount + tax if inclusive else amount,
+		},
+	}
+
+
 def _apply_refund_taxes(store_doc, credit_note, refund: dict, quantities: dict, side: str) -> None:
 	"""Replace the copied tax rows with the amounts Shopify actually refunded.
 
@@ -688,7 +734,9 @@ def _apply_refund_taxes(store_doc, credit_note, refund: dict, quantities: dict, 
 					"included_in_print_rate": 1,
 				},
 			)
-		for account, amount in _split_like(shipping_rows or [], shipping_amount).items():
+		for account, amount in _split_like(
+			shipping_rows if not store_doc.shipping_item else [], shipping_amount
+		).items():
 			credit_note.append(
 				"taxes",
 				{
@@ -714,7 +762,9 @@ def _apply_refund_taxes(store_doc, credit_note, refund: dict, quantities: dict, 
 			},
 		)
 
-	if shipping_amount != ZERO:
+	if shipping_amount != ZERO and not store_doc.shipping_item:
+		# Not when shipping is an Item: it is credited as a line above, and adding a charge
+		# row as well would reverse the postage twice.
 		freight = shipping_rows or tax_rows
 		if not shipping_rows and tax_rows:
 			frappe.log_error(
@@ -781,14 +831,13 @@ def _split_like(rows: list, total: Decimal) -> dict[str, Decimal]:
 # --------------------------------------------------------------------------------------
 
 
-def _note_covering(delivery_notes: list[str], restocking: dict) -> str | None:
-	"""The delivery note that shipped the most of what is being returned.
+def _notes_by_coverage(delivery_notes: list[str], restocking: dict) -> list[str]:
+	"""The notes that carry any of the returned items, the fullest first.
 
-	A refund can span two notes, and ERPNext returns against one document at a time. Choosing
-	the note carrying the most of the refunded items returns as much as one document can; the
-	rest is reported rather than silently dropped.
+	A refund can span several despatches and ERPNext returns against one document at a
+	time, so the caller works through this list rather than taking only the best one.
 	"""
-	best, best_cover = None, 0
+	scored = []
 	for name in delivery_notes:
 		shipped = frappe.get_all(
 			"Delivery Note Item",
@@ -798,10 +847,10 @@ def _note_covering(delivery_notes: list[str], restocking: dict) -> str | None:
 		cover = sum(
 			min(row.qty, restocking[row.item_code]["qty"]) for row in shipped if row.item_code in restocking
 		)
-		if cover > best_cover:
-			best, best_cover = name, cover
+		if cover > 0:
+			scored.append((cover, name))
 
-	if not best:
+	if not scored:
 		frappe.log_error(
 			title="Shopify refund: no delivery note carries the returned items",
 			message=(
@@ -809,7 +858,7 @@ def _note_covering(delivery_notes: list[str], restocking: dict) -> str | None:
 				"Stock was not returned; restock it by hand if the goods came back."
 			),
 		)
-	return best
+	return [name for _cover, name in sorted(scored, reverse=True)]
 
 
 def _restock(store_doc, refund: dict, order_gid: str | None, quantities: dict) -> str | None:
@@ -838,10 +887,44 @@ def _restock(store_doc, refund: dict, order_gid: str | None, quantities: dict) -
 		# would invent inventory that was never removed.
 		return None
 
-	delivery_note = _note_covering(delivery_notes, restocking)
-	if not delivery_note:
-		return None
+	# One return document per despatch, because ERPNext returns against one document at a
+	# time and a refund can span several. Two shirts shipped in two parcels and both
+	# returned used to bring back one: the best-covering note was chosen, the remainder was
+	# dropped, and nothing was logged -- so availability under-reported by a unit for ever,
+	# and that wrong figure was pushed to Shopify as the truth.
+	remaining = {code: entry["qty"] for code, entry in restocking.items()}
+	created = []
+	for note in _notes_by_coverage(delivery_notes, restocking):
+		if not any(qty > 0 for qty in remaining.values()):
+			break
+		made = _return_against(store_doc, refund, order_gid, note, restocking, remaining)
+		if made:
+			created.append(made)
 
+	short = {code: qty for code, qty in remaining.items() if qty > 0}
+	if short:
+		# Now actually reachable. The old message only fired when *no* note matched at all,
+		# which is not the case this was written for.
+		frappe.log_error(
+			title="Shopify refund: not everything could be restocked",
+			message=(
+				f"Order {order_gid}, refund {refund.get('id')}. Still to return: {short}. "
+				f"Notes searched: {delivery_notes}. Restock by hand if the goods came back."
+			),
+		)
+
+	return created[0] if created else None
+
+
+def _return_against(
+	store_doc,
+	refund: dict,
+	order_gid: str | None,
+	delivery_note: str,
+	restocking: dict,
+	remaining: dict,
+) -> str | None:
+	"""One return Delivery Note against one despatch, drawing `remaining` down as it goes."""
 	from erpnext.controllers.sales_and_purchase_return import make_return_doc
 
 	with inbound_write():
@@ -858,7 +941,6 @@ def _restock(store_doc, refund: dict, order_gid: str | None, quantities: dict) -
 		# Drawn down per row, for the same reason as the credit note above: one item across two
 		# delivery lines would otherwise be restocked twice, and ERPNext would refuse the whole
 		# return for over-returning rather than restock the right amount.
-		remaining = {code: entry["qty"] for code, entry in restocking.items()}
 		kept = []
 		for row in doc.items:
 			entry = restocking.get(row.item_code)
@@ -965,6 +1047,34 @@ def _reverse_payment(store_doc, credit_note: str, refund: dict, side: str) -> st
 	return entry.name
 
 
+def _itemised_refund_total(refund: dict, side: str) -> Decimal:
+	"""The refund's own line items and shipping, with their tax. What a credit note models."""
+	total = ZERO
+	for node in (refund.get("refundLineItems") or {}).get("nodes") or []:
+		total += money_field(node, "subtotalSet", side) + money_field(node, "totalTaxSet", side)
+	for node in (refund.get("refundShippingLines") or {}).get("nodes") or []:
+		total += money_field(node, "subtotalAmountSet", side) + money_field(node, "taxAmountSet", side)
+	return total
+
+
+def _note_retained_difference(refund: dict, side: str, credited: Decimal) -> None:
+	"""Say so when the customer was credited more than the gateways returned.
+
+	A retained restocking fee, or part of a refund issued as store credit. Nothing here can
+	book it -- which account it belongs to is the merchant's decision -- but it must not
+	pass unremarked, because the credit note and the bank will differ by exactly this.
+	"""
+	moved = money_field(refund, "totalRefundedSet", side)
+	if moved == ZERO or credited == moved:
+		return
+	frappe.logger("shopify_integration").info(
+		f"Refund {refund.get('id')}: credited {credited} but {moved} left the gateways "
+		f"(difference {credited - moved}). A retained fee or part-settlement in store credit; "
+		"the reversing payment follows the money, so that difference stays on the customer's "
+		"account until somebody books it."
+	)
+
+
 def _assert_credit_matches(credit_note, refund: dict, side: str) -> None:
 	"""Refuse a credit note that does not add up to the refund it represents.
 
@@ -975,12 +1085,21 @@ def _assert_credit_matches(credit_note, refund: dict, side: str) -> None:
 	Compared against Shopify's own total for the refund, negated: a return invoice carries
 	negative amounts.
 	"""
-	expected = money_field(refund, "totalRefundedSet", side)
+	# What the refund is *worth*, not what the gateways moved. `totalRefundedSet` is the
+	# total across the refund's transactions, and the two part company routinely: a
+	# merchant who returns a 1,000 item but keeps a 100 restocking fee moves 900, and a
+	# refund split between a card and a gift card moves it in two pieces. The credit note
+	# is built from the refunded lines at the invoice's own rates, so that is what it has
+	# to be checked against -- comparing it to the cash refused the whole refund and posted
+	# nothing at all, which is worse than either number.
+	expected = _itemised_refund_total(refund, side)
 	if expected == ZERO:
 		return
 
 	computed = abs(from_document(credit_note.get("grand_total")))
 	precision = frappe.get_precision("Sales Invoice", "grand_total") or 2
+
+	_note_retained_difference(refund, side, computed)
 
 	if not totals_match(computed, expected, precision):
 		frappe.throw(
