@@ -1070,3 +1070,56 @@ class TestInboundFailuresAreRetried(FrappeTestCase):
 			),
 			"nothing retries inbound failures unless this is on the scheduler",
 		)
+
+
+class TestARefundOfPostageAlone(FrappeTestCase):
+	"""Refunding the delivery charge for a late parcel names no line items, and that was
+	refused outright -- Shopify showed the money returned and ERPNext did not, permanently,
+	because nothing retried it either. A store that books shipping as an Item has a line to
+	credit it against, so that much can go through on its own.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import SECRET_A, make_store
+
+		make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
+
+	def _refund(self, shipping=True):
+		nodes = [{"subtotalAmountSet": _bag("20.00"), "taxAmountSet": _bag("2.00")}] if shipping else []
+		return {"id": "gid://shopify/Refund/post-1", "refundShippingLines": {"nodes": nodes}}
+
+	def test_a_store_with_a_shipping_item_can_credit_it(self):
+		from shopify_integration.inbound.refund import _refunded_shipping_only
+
+		self.assertTrue(
+			_refunded_shipping_only(frappe._dict({"shipping_item": "ZZ-FREIGHT"}), self._refund())
+		)
+
+	def test_a_store_without_one_cannot(self):
+		"""ERPNext will not take a Sales Invoice with no item lines at all, so there is
+		nowhere to put the amount until somebody says where."""
+		from shopify_integration.inbound.refund import _refunded_shipping_only
+
+		self.assertFalse(_refunded_shipping_only(frappe._dict({"shipping_item": None}), self._refund()))
+
+	def test_a_refund_of_nothing_in_particular_is_still_refused(self):
+		"""A goodwill gesture has no line in ERPNext to credit. Refusing loudly beats
+		inventing an account for somebody's money."""
+		from shopify_integration.inbound.refund import _refunded_shipping_only
+
+		self.assertFalse(
+			_refunded_shipping_only(
+				frappe._dict({"shipping_item": "ZZ-FREIGHT"}), self._refund(shipping=False)
+			)
+		)
+
+	def test_the_refusal_says_what_to_do_about_it(self):
+		import inspect
+
+		from shopify_integration.inbound import refund as module
+
+		source = inspect.getsource(module.create_credit_note)
+		self.assertIn("Shipping Item", source)
+		self.assertIn("goodwill", source)

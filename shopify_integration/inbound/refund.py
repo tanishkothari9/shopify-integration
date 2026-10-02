@@ -157,8 +157,15 @@ def create_credit_note(store_doc, refund: dict) -> dict:
 		)
 
 	quantities = refund_quantities(store_doc, refund, _side_for(invoice_name, store_doc.company))
-	if not quantities:
-		frappe.throw(_("Refund {0} names no line items this ERPNext site knows about.").format(refund_gid))
+	if not quantities and not _refunded_shipping_only(store_doc, refund):
+		frappe.throw(
+			_(
+				"Refund {0} names no line items this ERPNext site knows about. A refund of "
+				"shipping alone can be credited when the store has a Shipping Item set; a "
+				"refund of nothing in particular -- a goodwill gesture -- has no line in "
+				"ERPNext to credit, so somebody has to book it by hand."
+			).format(refund_gid)
+		)
 
 	side = _side_for(invoice_name, store_doc.company)
 
@@ -475,6 +482,23 @@ def _original_invoice(store: str, order_gid: str | None) -> str | None:
 		{"shopify_store": store, "shopify_order_gid": order_gid, "is_return": 0, "docstatus": 1},
 		"name",
 	)
+
+
+def _refunded_shipping_only(store_doc, refund: dict) -> bool:
+	"""Whether this refund is postage and nothing else, on a store that can credit it.
+
+	Refunding the delivery charge for a late parcel is an ordinary thing to do, and it used
+	to be refused outright: no line items meant no credit note, so Shopify showed the money
+	returned and ERPNext did not. A store that books shipping as an Item has a line to
+	credit it against -- `_with_refunded_shipping` adds it -- so the refund can go through.
+
+	A store that books shipping as a charge row has no such line, and ERPNext will not
+	accept a Sales Invoice with no items at all. That case needs somewhere to put the
+	amount, which is a decision about accounts rather than about code.
+	"""
+	if not store_doc.shipping_item:
+		return False
+	return any((refund.get("refundShippingLines") or {}).get("nodes") or [])
 
 
 def refund_quantities(store_doc, refund: dict, side: str) -> dict[str, dict]:
