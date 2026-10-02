@@ -1,0 +1,22 @@
+# Which media is already attached to each variant, so appending it twice is avoided.
+#
+# Paged, and with a small media page per variant, because this is a connection inside a
+# connection and Shopify charges the product of the two. Ten images on a single variant is
+# already generous; fifty variants a page keeps one page near 650 points.
+query ProductVariantMedia($id: ID!, $cursor: String) {
+  product(id: $id) {
+    variants(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+          id
+          media(first: 10) {
+            nodes {
+              ... on MediaImage { id }
+            }
+          }
+        }
+      }
+    }
+  }
+}

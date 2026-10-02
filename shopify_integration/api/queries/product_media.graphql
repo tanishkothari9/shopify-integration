@@ -1,12 +1,17 @@
-# Everything the app needs to know about a product's images in one call.
+# A product's own images, and nothing else.
 #
-# `originalSource.url` is what Shopify fetched the image from, which is how media created
-# before this app recorded its own can still be matched to an ERPNext file. `status` and
-# `mediaErrors` are here because Shopify processes media asynchronously: a mutation that
-# returned no errors can still leave a FAILED image on the product minutes later, and
-# without this the product quietly shows nothing where a photograph should be.
+# Deliberately spare, because Shopify prices a query by its shape before running it: every
+# field selected inside a connection is charged once per node requested. The first version
+# of this document also nested `variants(first: 100) { media(first: 250) }`, which
+# multiplies out to roughly 26,000 points against a ceiling of 1,000 on a standard plan --
+# so the whole image sync was refused with MAX_COST_EXCEEDED before it did anything, and the
+# fake clients in the tests could not have noticed. Variant media is its own query now, and
+# only asked for when there is a variant image to attach.
 #
 # 250 is Shopify's own ceiling on media per product, so one page is always the whole list.
+# `status` and `mediaErrors` are here because Shopify processes media asynchronously: a
+# mutation that returned no errors can still leave a FAILED image on the product minutes
+# later, and without this the product quietly shows nothing where a photograph should be.
 query ProductMedia($id: ID!) {
   product(id: $id) {
     id
@@ -15,20 +20,7 @@ query ProductMedia($id: ID!) {
         ... on MediaImage {
           id
           status
-          alt
-          image { url }
-          originalSource { url }
           mediaErrors { code details message }
-        }
-      }
-    }
-    variants(first: 100) {
-      nodes {
-        id
-        media(first: 250) {
-          nodes {
-            ... on MediaImage { id }
-          }
         }
       }
     }

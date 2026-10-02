@@ -183,16 +183,31 @@ def _record_owned(link_name: str, owned: dict[str, str]) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def _product_state(client: ShopifyClient, product_gid: str) -> dict:
+def _product_media_nodes(client: ShopifyClient, product_gid: str) -> list[dict]:
 	data = client.execute(load_query("product_media"), {"id": product_gid}, cost_hint=10)
 	product = data.get("product") or {}
-	media = [node for node in ((product.get("media") or {}).get("nodes") or []) if node.get("id")]
-	variants = {
-		node["id"]: [m["id"] for m in ((node.get("media") or {}).get("nodes") or []) if m.get("id")]
-		for node in ((product.get("variants") or {}).get("nodes") or [])
-		if node.get("id")
-	}
-	return {"media": media, "variants": variants}
+	return [node for node in ((product.get("media") or {}).get("nodes") or []) if node.get("id")]
+
+
+def _variant_media(client: ShopifyClient, product_gid: str) -> dict[str, list[str]]:
+	"""variant gid -> the media already attached to it.
+
+	Its own call, and only made when there is a variant image to attach: asking for it
+	alongside the product's media is a connection inside a connection, and Shopify charges
+	the product of the two.
+	"""
+	attached = {}
+	for node in client.paginate(
+		load_query("product_variant_media"),
+		{"id": product_gid},
+		"product.variants",
+		cost_hint=20,
+	):
+		if node.get("id"):
+			attached[node["id"]] = [
+				m["id"] for m in ((node.get("media") or {}).get("nodes") or []) if m.get("id")
+			]
+	return attached
 
 
 def _create(client: ShopifyClient, product_gid: str, sources: list[tuple[str, str]], subject: str) -> dict:
@@ -253,8 +268,7 @@ def sync_item_media(client: ShopifyClient, store_doc, item_code: str) -> dict:
 		return {"skipped": f"{subject} has no Shopify product"}
 
 	plan = media_plan(subject)
-	state = _product_state(client, link.product_gid)
-	on_product = {node["id"]: node for node in state["media"]}
+	on_product = {node["id"]: node for node in _product_media_nodes(client, link.product_gid)}
 
 	# Media the merchant deleted in Shopify is no longer ours to account for.
 	owned = {url: gid for url, gid in owned_media(link.name).items() if gid in on_product}
@@ -282,12 +296,22 @@ def sync_item_media(client: ShopifyClient, store_doc, item_code: str) -> dict:
 
 	to_delete = [gid for url, gid in owned.items() if url not in wanted] + list(failed.values())
 	if to_delete:
-		client.execute(
+		result = client.execute(
 			load_query("product_delete_media"),
 			{"productId": link.product_gid, "mediaIds": to_delete},
 			cost_hint=10,
 		)
-		owned = {url: gid for url, gid in owned.items() if gid not in to_delete}
+		payload = result.get("productDeleteMedia") or {}
+		errors = payload.get("mediaUserErrors") or []
+		if errors:
+			failures.append(f"{subject}: Shopify refused to remove an image -- {_readable(errors)}")
+
+		# Only what Shopify says it actually deleted. Forgetting a media id that is still on
+		# the product is worse than leaving the record: the next sync sees media it has no
+		# record of, reads it as the merchant's own, and will never delete it or count it
+		# against the ceiling again.
+		gone = set(payload.get("deletedMediaIds") or [])
+		owned = {url: gid for url, gid in owned.items() if gid not in gone}
 
 	sources = []
 	for file_url in wanted:
@@ -307,7 +331,7 @@ def sync_item_media(client: ShopifyClient, store_doc, item_code: str) -> dict:
 	_record_owned(link.name, owned)
 
 	_feature_the_main_image(client, link.product_gid, wanted, owned, on_product, created)
-	attached = _attach_to_variants(client, store_doc.name, link.product_gid, plan, owned, state["variants"])
+	attached = _attach_to_variants(client, store_doc.name, link.product_gid, plan, owned)
 
 	return {
 		"added": len(created),
@@ -335,16 +359,28 @@ def _feature_the_main_image(client, product_gid, wanted, owned, on_product, crea
 	if featured not in created.values() and order and order[0] == featured:
 		return False
 
-	client.execute(
+	result = client.execute(
 		load_query("product_reorder_media"),
 		{"id": product_gid, "moves": [{"id": featured, "newPosition": "0"}]},
 		cost_hint=10,
 	)
+	errors = (result.get("productReorderMedia") or {}).get("mediaUserErrors") or []
+	if errors:
+		# Not fatal -- every image is on the product, one of them is in the wrong place --
+		# but silence here is how the main photograph stays wrong for ever.
+		frappe.logger("shopify_integration").warning(
+			f"{product_gid}: could not feature the main image -- {_readable(errors)}"
+		)
+		return False
 	return True
 
 
-def _attach_to_variants(client, store, product_gid, plan, owned, already) -> int:
+def _attach_to_variants(client, store, product_gid, plan, owned) -> int:
 	"""Give each variant the media of its own images, where it does not have them yet."""
+	if not plan["by_variant"]:
+		return 0
+
+	already = _variant_media(client, product_gid)
 	variant_media = []
 	for item_code, files in plan["by_variant"].items():
 		variant_gid = frappe.db.get_value(
@@ -425,12 +461,18 @@ def enqueue_for_item(item_code: str) -> int:
 	common case on a catalogue where most items were never published."""
 	queued = 0
 	subject = product_subject(item_code)
-	for store in frappe.get_all(
-		"Shopify Item Link",
-		filters={"item_code": ["in", [item_code, subject]]},
-		pluck="store",
-		distinct=True,
-	):
+
+	# A template has no link of its own -- it has no Shopify variant to point at -- so its
+	# children carry `template_item` instead. Looking only at item_code finds nothing for a
+	# template, and the images staff attach to the template are the product's lead
+	# photographs, so they were the ones that never shipped.
+	stores = set(
+		frappe.get_all(
+			"Shopify Item Link", filters={"item_code": ["in", [item_code, subject]]}, pluck="store"
+		)
+	) | set(frappe.get_all("Shopify Item Link", filters={"template_item": subject}, pluck="store"))
+
+	for store in stores:
 		if enqueue_media(store, item_code):
 			queued += 1
 	return queued

@@ -28,8 +28,12 @@ from frappe.utils import add_to_date, cint, get_datetime, get_system_timezone, n
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.sync.engine import enqueue_sync
 
-#: Inventory items per levels query. Shopify's `nodes(ids:)` accepts up to 250.
-LEVELS_PAGE = 200
+#: Inventory items per levels query. Not Shopify's `nodes(ids:)` ceiling of 250 but its
+#: *cost* ceiling: this document asks each item for up to 20 locations, which Shopify
+#: prices at 62 points per item, and a single query may not exceed 1,000. At 200 a page
+#: this was refused outright, so the nightly drift check -- the safety net for everything
+#: else -- failed on its first page for every store and was swallowed by the caller.
+LEVELS_PAGE = 15
 
 #: How far back to look for missed orders when a store has never been reconciled.
 FIRST_RUN_LOOKBACK_DAYS = 7

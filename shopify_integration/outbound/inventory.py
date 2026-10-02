@@ -277,7 +277,13 @@ def _push_batch(client: ShopifyClient, store_doc, batch: list[dict], allow_retry
 	"""One inventorySetQuantities call for a batch, with compare-and-set."""
 	current = _current_levels(client, batch)
 
-	quantities = []
+	# All or nothing, per mutation. Shopify's own words for COMPARE_QUANTITY_REQUIRED are
+	# "The compareQuantity argument must be given to each quantity or ignored using
+	# ignoreCompareQuantity" -- so an entry without one does not merely lose its own
+	# optimistic-concurrency check, it fails the whole call, and every other item in the
+	# batch goes unset with it. An item Shopify has never stocked at that location has no
+	# level to compare against, which is ordinary the first time a warehouse is mapped.
+	compared, uncompared = [], []
 	for target in batch:
 		entry = {
 			"inventoryItemId": target["inventory_item_gid"],
@@ -285,23 +291,21 @@ def _push_batch(client: ShopifyClient, store_doc, batch: list[dict], allow_retry
 			"quantity": cint(target["quantity"]),
 		}
 		compare = current.get((target["inventory_item_gid"], target["location_gid"]))
-		if compare is not None:
+		if compare is None:
+			uncompared.append(entry)
+		else:
 			entry["compareQuantity"] = cint(compare)
-		quantities.append(entry)
+			compared.append(entry)
+
+	if uncompared:
+		_send(client, store_doc, uncompared, ignore_compare=True)
+
+	quantities = compared
+	if not quantities:
+		return
 
 	try:
-		client.execute(
-			load_query("inventory_set_quantities"),
-			{
-				"input": {
-					"name": "available",
-					"reason": ADJUSTMENT_REASON,
-					"referenceDocumentUri": reference_uri(store_doc.name),
-					"quantities": quantities,
-				}
-			},
-			cost_hint=10 + len(quantities),
-		)
+		_send(client, store_doc, quantities)
 	except ShopifyUserError as exc:
 		if not _is_compare_mismatch(exc):
 			raise
@@ -321,24 +325,54 @@ def _push_batch(client: ShopifyClient, store_doc, batch: list[dict], allow_retry
 	stamp_synced([target["link"] for target in batch])
 
 
+def _send(client: ShopifyClient, store_doc, quantities: list[dict], *, ignore_compare: bool = False) -> None:
+	"""One inventorySetQuantities call.
+
+	`ignoreCompareQuantity` is for the entries that have no level to compare against -- a
+	warehouse newly mapped to a location where Shopify has never stocked the item. Shopify
+	deprecated the flag in favour of a null `changeFromQuantity`, with removal in 2026-04;
+	`test_audit_fixes.py` fails when that version is vendored.
+	"""
+	payload = {
+		"name": "available",
+		"reason": ADJUSTMENT_REASON,
+		"referenceDocumentUri": reference_uri(store_doc.name),
+		"quantities": quantities,
+	}
+	if ignore_compare:
+		payload["ignoreCompareQuantity"] = True
+
+	client.execute(
+		load_query("inventory_set_quantities"),
+		{"input": payload},
+		cost_hint=10 + len(quantities),
+	)
+
+
 def _current_levels(client: ShopifyClient, batch: list[dict]) -> dict[tuple[str, str], int]:
 	"""Shopify's current 'available' per (inventory item, location), for compareQuantity."""
-	ids = sorted({target["inventory_item_gid"] for target in batch})
-	if not ids:
-		return {}
-
-	data = client.execute(load_query("inventory_levels"), {"ids": ids}, cost_hint=5 + len(ids))
+	by_location: dict[str, set[str]] = {}
+	for target in batch:
+		by_location.setdefault(target["location_gid"], set()).add(target["inventory_item_gid"])
 
 	levels: dict[tuple[str, str], int] = {}
-	for node in data.get("nodes") or []:
-		if not node:
-			continue
-		item_gid = node.get("id")
-		for level in (node.get("inventoryLevels") or {}).get("nodes") or []:
-			location_gid = (level.get("location") or {}).get("id")
+	for location_gid, item_gids in by_location.items():
+		data = client.execute(
+			load_query("inventory_level_at"),
+			{"ids": sorted(item_gids), "locationId": location_gid},
+			cost_hint=5 + len(item_gids),
+		)
+		for node in data.get("nodes") or []:
+			if not node:
+				continue
+			level = node.get("inventoryLevel")
+			if not level:
+				# Not stocked at this location. Absent rather than zero: the two mean
+				# different things to the mutation below.
+				continue
 			for quantity in level.get("quantities") or []:
 				if quantity.get("name") == "available":
-					levels[(item_gid, location_gid)] = cint(quantity.get("quantity"))
+					levels[(node.get("id"), location_gid)] = cint(quantity.get("quantity"))
 	return levels
 
 

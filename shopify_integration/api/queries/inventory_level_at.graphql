@@ -1,0 +1,25 @@
+# Current availability for a set of inventory items at ONE location.
+#
+# The singular `inventoryLevel(locationId:)` rather than the `inventoryLevels` connection,
+# because the caller already knows exactly which location it is asking about. The
+# connection costs 2 + 20 x 3 = 62 points per item -- at a batch of 100 that is ~6,200
+# against a per-query ceiling of 1,000, so a Stock Reconciliation touching thirty lines was
+# refused outright with MAX_COST_EXCEEDED and every row in the group was marked Failed with
+# the stock never sent. This shape is 3 points per item.
+#
+# It also cannot truncate. Asking the connection for the first N locations and hoping the
+# mapped one is among them loses the compareQuantity for that pair, and a mutation with
+# compareQuantity on some entries and not others is rejected outright.
+query inventoryLevelAt($ids: [ID!]!, $locationId: ID!) {
+  nodes(ids: $ids) {
+    ... on InventoryItem {
+      id
+      inventoryLevel(locationId: $locationId) {
+        quantities(names: ["available"]) {
+          name
+          quantity
+        }
+      }
+    }
+  }
+}

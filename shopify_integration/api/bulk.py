@@ -45,9 +45,6 @@ MAX_RESULT_BYTES = 5 * 1024 * 1024 * 1024
 #: large enough that we are not paying a commit per product across 50,000 of them.
 COMMIT_EVERY = 200
 
-#: Seconds between polls while an operation is running.
-POLL_INTERVAL_SECONDS = 30
-
 
 def start_import(store: str, purpose: str = "product_import") -> str:
 	"""Kick off a catalogue import. Returns the Shopify Bulk Operation name.
@@ -126,7 +123,17 @@ def poll(operation_name: str) -> str:
 	publish_progress(doc)
 
 	if status in ("Created", "Running"):
-		schedule_poll(operation_name)
+		# Deliberately not re-scheduling itself here. It used to, and that could not be
+		# reasoned about either way: `deduplicate` suppresses a job that is QUEUED *or*
+		# STARTED, so depending on whether the after-commit enqueue lands before or after the
+		# worker finishes, the chain either stops dead on the first poll or becomes a tight
+		# loop -- one long-queue worker asking `currentBulkOperation` as fast as it can turn
+		# around for the half hour an 87k export takes, spending throttle points and holding
+		# a slot that order webhooks need. A pacing constant existed for it and was never used.
+		#
+		# `poll_running_operations` on the */5 cron is the one driver now, with the
+		# `bulk_operations/finish` webhook as the fast path. Five minutes of latency on an
+		# operation that runs for thirty is not worth a self-rescheduling loop.
 		return status
 
 	if status == "Completed" or (status == "Failed" and current.get("partialDataUrl")):
@@ -299,20 +306,29 @@ def process(operation_name: str) -> dict:
 	since_commit = 0
 
 	for lines_done, product in iter_product_groups(path, skip=skip):
+		# A savepoint, not a bare rollback. `frappe.db.rollback()` with no save_point issues a
+		# full ROLLBACK and opens a new transaction, discarding every product written since
+		# the last checkpoint -- up to COMMIT_EVERY - 1 perfectly good ones -- while `applied`
+		# still counts them and `lines_consumed` then advances past them. Those products exist
+		# on Shopify, have no ERPNext Item or link, and nothing ever revisits them.
+		save_point = "shopify_bulk_product"
+		frappe.db.savepoint(save_point)
 		try:
 			write_product_mapping(doc.store, product)
 			applied += 1
 		except Exception:
-			# Roll back what this product managed to write before it broke. Without it the
-			# Items, Item Groups and Attributes it created stay in the transaction and the
-			# next checkpoint commits a half-built product -- which then looks imported, so no
-			# retry ever revisits it.
-			frappe.db.rollback()
+			# Undo only what this product managed to write. Without it the Items, Item Groups
+			# and Attributes it created stay in the transaction and the next checkpoint
+			# commits a half-built product -- which then looks imported, so no retry ever
+			# revisits it.
+			frappe.db.rollback(save_point=save_point)
 			failures += 1
 			frappe.log_error(
 				title=f"Shopify product import failed: {product.get('id')}",
 				message=frappe.get_traceback(),
 			)
+		else:
+			frappe.db.release_savepoint(save_point)
 
 		since_commit += 1
 		if since_commit >= COMMIT_EVERY:

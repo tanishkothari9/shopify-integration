@@ -209,8 +209,9 @@ def _settle_safely(store_doc, refund: dict) -> tuple[str | None, str | None]:
 	return settled, None
 
 
-def owed_by_sku(order: dict) -> dict[str, int]:
-	"""Per SKU, how many units Shopify still expects to be delivered.
+def owed_by_item(store_doc, order: dict) -> tuple[dict[str, int], list[str]]:
+	"""Per ERPNext item, how many units Shopify still expects to be delivered, and the
+	lines that still owe something but could not be identified at all.
 
 	Two numbers, and the smaller wins. ``currentQuantity`` is what is left on the order after
 	every refund; ``unfulfilledQuantity`` is what has not shipped. A unit still owed is one
@@ -220,13 +221,45 @@ def owed_by_sku(order: dict) -> dict[str, int]:
 	as "something is still owed", but nothing is -- both shipped, and one came back.
 	"""
 	owed: dict[str, int] = {}
+	unidentified: list[str] = []
+
 	for line in (order.get("lineItems") or {}).get("nodes") or []:
-		sku = cstr(line.get("sku")).strip()
-		if not sku:
+		remaining = max(min(cint(line.get("currentQuantity")), cint(line.get("unfulfilledQuantity"))), 0)
+		item_code = _line_item_code(store_doc, line)
+		if not item_code:
+			# Only a problem if this line still owes something. A line with nothing
+			# outstanding cannot change the answer either way.
+			if remaining:
+				unidentified.append(cstr(line.get("title")) or cstr((line.get("variant") or {}).get("id")))
 			continue
-		remaining = min(cint(line.get("currentQuantity")), cint(line.get("unfulfilledQuantity")))
-		owed[sku] = owed.get(sku, 0) + max(remaining, 0)
-	return owed
+		owed[item_code] = owed.get(item_code, 0) + remaining
+
+	return owed, unidentified
+
+
+def _line_item_code(store_doc, line: dict) -> str | None:
+	"""The ERPNext item one order line is for, without creating anything.
+
+	By variant gid first, which every Shopify line has, then by SKU. Keying the whole
+	calculation on SKU -- as this did -- quietly dropped any line whose SKU is blank, and a
+	blank SKU is ordinary: `resolve_item_code` names those items `SHOPIFY-<id>`, so they
+	import perfectly well and then disappear from the one map that decides whether an order
+	still owes goods.
+	"""
+	variant_gid = cstr((line.get("variant") or {}).get("id")).strip()
+	if variant_gid:
+		found = frappe.db.get_value(
+			"Shopify Item Link", {"store": store_doc.name, "variant_gid": variant_gid}, "item_code"
+		)
+		if found:
+			return cstr(found)
+
+	sku = cstr(line.get("sku")).strip()
+	if not sku:
+		return None
+
+	found = frappe.db.get_value("Shopify Item Link", {"store": store_doc.name, "sku": sku}, "item_code")
+	return cstr(found) if found else (sku if frappe.db.exists("Item", sku) else None)
 
 
 def settle_after_refund(store_doc, refund: dict) -> str | None:
@@ -276,7 +309,18 @@ def settle_after_refund(store_doc, refund: dict) -> str | None:
 		# genuinely finished and holds no reservation to release.
 		return None
 
-	owed = owed_by_sku(order)
+	owed, unidentified = owed_by_item(store_doc, order)
+
+	if unidentified:
+		# One line of this order cannot be matched to an ERPNext item and still owes goods.
+		# Every outcome below rests on the claim that `owed` is the whole truth, and it is
+		# not -- so do nothing. A stuck reservation is visible and fixable; closing an order
+		# that still owes, and telling Shopify those units are sellable again, is not.
+		frappe.logger("shopify_integration").warning(
+			f"{name}: not settling after refund -- no ERPNext item for "
+			f"{', '.join(unidentified)}. Link the item and replay the refund."
+		)
+		return None
 
 	if not any(owed.values()):
 		with inbound_write():

@@ -311,8 +311,17 @@ class TestCompareAndSetConflictIsRetryable(InventoryTestCase):
 
 		class AlwaysConflicts:
 			def execute(self, query, variables, cost_hint=0):
-				if "inventoryLevels" in str(query) or "nodes" in str(variables):
-					return {"nodes": []}
+				if "locationId" in (variables or {}):
+					# A level Shopify already holds, so the write below takes the
+					# compare-and-set path rather than the ignore-compare one.
+					return {
+						"nodes": [
+							{
+								"id": "gid://shopify/InventoryItem/1",
+								"inventoryLevel": {"quantities": [{"name": "available", "quantity": 9}]},
+							}
+						]
+					}
 				raise mismatch
 
 		batch = [
@@ -334,8 +343,17 @@ class TestCompareAndSetConflictIsRetryable(InventoryTestCase):
 
 		class AlwaysRefuses:
 			def execute(self, query, variables, cost_hint=0):
-				if "inventoryLevels" in str(query) or "nodes" in str(variables):
-					return {"nodes": []}
+				if "locationId" in (variables or {}):
+					# A level Shopify already holds, so the write below takes the
+					# compare-and-set path rather than the ignore-compare one.
+					return {
+						"nodes": [
+							{
+								"id": "gid://shopify/InventoryItem/1",
+								"inventoryLevel": {"quantities": [{"name": "available", "quantity": 9}]},
+							}
+						]
+					}
 				raise ShopifyUserError("Inventory item does not exist")
 
 		batch = [

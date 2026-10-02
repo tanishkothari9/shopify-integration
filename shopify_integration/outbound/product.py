@@ -176,7 +176,14 @@ def push_products(store: str, rows: list[dict]) -> None:
 			)
 			continue
 
-		item = frappe.get_doc("Item", item_code)
+		# The product belongs to the template, not to the variant that was saved. A variant's
+		# link carries the *parent* product's gid -- every child of a template shares one --
+		# so building the payload from the variant sent the whole product's status and title
+		# from one size. Disabling a single out-of-production size archived the entire range
+		# from the storefront, and with sync_item_titles on it renamed the product to
+		# "Kurta Set - Red / XXL".
+		subject = frappe.get_cached_value("Item", item_code, "variant_of") or item_code
+		item = frappe.get_doc("Item", subject)
 
 		# Only what ERPNext actually owns. Shopify holds the storefront copy: the title a
 		# customer reads and the description someone wrote for the product page. Sending
@@ -187,7 +194,7 @@ def push_products(store: str, rows: list[dict]) -> None:
 		# Whether the item is sellable is ERPNext's to say, so status still goes.
 		payload = {
 			"id": link.product_gid,
-			"status": "ARCHIVED" if item.disabled else "ACTIVE",
+			"status": "ARCHIVED" if _product_is_dead(subject, item) else "ACTIVE",
 		}
 
 		if frappe.db.get_value("Shopify Store", store, "sync_item_titles"):
@@ -209,6 +216,23 @@ def push_products(store: str, rows: list[dict]) -> None:
 			_mark_publish_decided(store, link.product_gid)
 
 		enqueue_media(store, item_code)
+
+
+def _product_is_dead(subject: str, item) -> bool:
+	"""Whether the whole Shopify product should be archived.
+
+	A template is dead when it is disabled itself, or when every variant under it is --
+	there is then nothing left to sell. One disabled size is not a reason to take the range
+	off the storefront; it is a reason for that variant to stop being sellable, which its
+	own inventory push already handles.
+	"""
+	if item.disabled:
+		return True
+	if not item.get("has_variants"):
+		return False
+
+	children = frappe.get_all("Item", filters={"variant_of": subject}, pluck="disabled")
+	return bool(children) and all(children)
 
 
 # --------------------------------------------------------------------------------------

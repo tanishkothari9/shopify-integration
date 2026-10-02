@@ -12,6 +12,7 @@ query order($id: ID!) {
   order(id: $id) {
     id
     name
+    test
     createdAt
     processedAt
     cancelledAt

@@ -11,7 +11,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from shopify_integration.inbound.refund import owed_by_sku, settle_after_refund
+from shopify_integration.inbound.refund import owed_by_item, settle_after_refund
 from shopify_integration.tests.test_orders import OrderTestCase
 
 
@@ -589,34 +589,86 @@ class TestCancellingAnUnpaidOrderWithRestock(FrappeTestCase):
 class TestWorkingOutWhatIsOwed(FrappeTestCase):
 	"""The measure the whole thing turns on."""
 
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import SECRET_A, make_store, with_hsn
+
+		cls.store = make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
+		cls.store_doc = frappe.get_cached_doc("Shopify Store", cls.store)
+		if not frappe.db.exists("Item", "EAR"):
+			item = frappe.new_doc("Item")
+			item.item_code = "EAR"
+			item.item_name = "EAR"
+			item.item_group = frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0]
+			item.stock_uom = "Nos"
+			with_hsn(item)
+			item.insert(ignore_permissions=True)
+			frappe.db.commit()
+
+	def owed(self, order):
+		"""Just the map; the unidentified half has its own tests below."""
+		return owed_by_item(self.store_doc, order)[0]
+
 	def test_a_shipped_and_returned_unit_is_not_owed(self):
 		"""#1122. currentQuantity says 1, unfulfilled says 0, and 0 is the answer."""
 		order = refund_payload("gid://shopify/Order/1", [("EAR", 2, 1, 0)])["order"]
-		self.assertEqual(owed_by_sku(order), {"EAR": 0})
+		self.assertEqual(self.owed(order), {"EAR": 0})
 
 	def test_an_unshipped_partly_refunded_line_is_owed_what_is_left(self):
 		order = refund_payload("gid://shopify/Order/1", [("EAR", 3, 2, 2)])["order"]
-		self.assertEqual(owed_by_sku(order), {"EAR": 2})
+		self.assertEqual(self.owed(order), {"EAR": 2})
 
 	def test_a_fully_refunded_line_is_owed_nothing(self):
 		order = refund_payload("gid://shopify/Order/1", [("EAR", 2, 0, 0)])["order"]
-		self.assertEqual(owed_by_sku(order), {"EAR": 0})
+		self.assertEqual(self.owed(order), {"EAR": 0})
 
 	def test_an_untouched_line_is_owed_in_full(self):
 		order = refund_payload("gid://shopify/Order/1", [("EAR", 2, 2, 2)])["order"]
-		self.assertEqual(owed_by_sku(order), {"EAR": 2})
+		self.assertEqual(self.owed(order), {"EAR": 2})
 
 	def test_the_smaller_of_the_two_always_wins(self):
 		"""Whichever way Shopify accounts for a refunded unit that had already shipped."""
 		order = refund_payload("gid://shopify/Order/1", [("EAR", 5, 4, 1)])["order"]
-		self.assertEqual(owed_by_sku(order), {"EAR": 1})
+		self.assertEqual(self.owed(order), {"EAR": 1})
 		order = refund_payload("gid://shopify/Order/1", [("EAR", 5, 1, 4)])["order"]
-		self.assertEqual(owed_by_sku(order), {"EAR": 1})
+		self.assertEqual(self.owed(order), {"EAR": 1})
 
-	def test_lines_without_a_sku_are_ignored(self):
+	def test_a_line_that_cannot_be_identified_is_reported_not_dropped(self):
+		"""The bug this replaced: a blank SKU was skipped, so a line still owing two units
+		read as owing nothing -- and `settle_after_refund` then closed the order and released
+		the reservation. A blank SKU is ordinary; `resolve_item_code` imports those items as
+		`SHOPIFY-<id>` quite happily."""
 		order = refund_payload("gid://shopify/Order/1", [("", 2, 2, 2)])["order"]
-		self.assertEqual(owed_by_sku(order), {})
+		owed, unidentified = owed_by_item(self.store_doc, order)
+
+		self.assertEqual(owed, {})
+		self.assertEqual(len(unidentified), 1, "the caller has to know the map is incomplete")
+
+	def test_a_line_that_owes_nothing_is_not_worth_reporting(self):
+		"""An unidentifiable line with no units outstanding cannot change the answer."""
+		order = refund_payload("gid://shopify/Order/1", [("", 2, 0, 0)])["order"]
+		self.assertEqual(owed_by_item(self.store_doc, order), ({}, []))
+
+	def test_a_line_is_identified_by_its_variant_when_the_sku_is_blank(self):
+		link = frappe.new_doc("Shopify Item Link")
+		link.store = self.store
+		link.item_code = "EAR"
+		link.sku = "EAR"
+		link.product_gid = "gid://shopify/Product/owed"
+		link.variant_gid = "gid://shopify/ProductVariant/owed"
+		link.insert(ignore_permissions=True)
+		frappe.db.commit()
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(
+			frappe.delete_doc, "Shopify Item Link", link.name, force=True, ignore_permissions=True
+		)
+
+		order = refund_payload("gid://shopify/Order/1", [("", 2, 2, 2)])["order"]
+		order["lineItems"]["nodes"][0]["variant"] = {"id": "gid://shopify/ProductVariant/owed"}
+
+		self.assertEqual(owed_by_item(self.store_doc, order), ({"EAR": 2}, []))
 
 	def test_two_lines_of_the_same_sku_add_up(self):
 		order = refund_payload("gid://shopify/Order/1", [("EAR", 1, 1, 1), ("EAR", 2, 2, 2)])["order"]
-		self.assertEqual(owed_by_sku(order), {"EAR": 3})
+		self.assertEqual(self.owed(order), {"EAR": 3})

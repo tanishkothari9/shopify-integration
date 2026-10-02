@@ -124,18 +124,32 @@ class _Client:
 				}
 			}
 
-		return {
-			"product": {
-				"id": PRODUCT,
-				"media": {"nodes": self.media},
-				"variants": {
-					"nodes": [
-						{"id": gid, "media": {"nodes": [{"id": m} for m in ids]}}
-						for gid, ids in self.variant_media.items()
-					]
-				},
+		if "cursor" in variables:
+			# The variant-media query, which is paginated and its own call -- asking for it
+			# alongside the product's media is a connection inside a connection, and Shopify
+			# charges the product of the two.
+			return {
+				"product": {
+					"variants": {
+						"pageInfo": {"hasNextPage": False, "endCursor": None},
+						"edges": [
+							{"node": {"id": gid, "media": {"nodes": [{"id": m} for m in ids]}}}
+							for gid, ids in self.variant_media.items()
+						],
+					}
+				}
 			}
-		}
+
+		return {"product": {"id": PRODUCT, "media": {"nodes": self.media}}}
+
+	def paginate(self, query, variables, connection_path, *, cost_hint=0):
+		"""The real client's paginator, in miniature: one page, read from `edges`."""
+		page = dict(variables)
+		page["cursor"] = None
+		data = self.execute(query, page, cost_hint)
+		connection = data["product"]["variants"]
+		for edge in connection.get("edges") or []:
+			yield edge["node"]
 
 	def media_ids(self):
 		return [m["id"] for m in self.media]

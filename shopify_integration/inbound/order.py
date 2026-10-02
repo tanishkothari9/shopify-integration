@@ -190,6 +190,23 @@ def fetch_order(store: str, payload: dict) -> dict | None:
 	if not order:
 		return None
 
+	if order.get("test"):
+		# Placed through the Bogus Gateway or a provider in test mode -- which is how
+		# everybody verifies this very integration, and how a merchant tries their checkout
+		# out before launch. Booked as real, one of these submits a Sales Order that reserves
+		# stock, a Sales Invoice, a Payment Entry into the real cash account and, once
+		# "fulfilled", a Delivery Note that takes the goods off the shelf and tells Shopify
+		# the shop has fewer than it does. Unpicking five submitted documents by hand is a
+		# bad first hour with a new integration.
+		#
+		# Returned as absent rather than thrown: every caller already treats None as "nothing
+		# to do here" and marks the event Success, which is the right outcome -- there is no
+		# fault to retry.
+		frappe.logger("shopify_integration").info(
+			f"Ignoring Shopify order {order.get('name') or gid}: it is a test order."
+		)
+		return None
+
 	_backfill_addresses(order, payload)
 
 	line_page = order.get("lineItems") or {}
