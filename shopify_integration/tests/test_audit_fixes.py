@@ -1395,3 +1395,48 @@ class TestADriftCorrectionWaitsForTheOrder(FrappeTestCase):
 		from shopify_integration.outbound import inventory as module
 
 		self.assertNotIn("DRIFT_SETTLE", inspect.getsource(module.enqueue_for_item))
+
+
+class TestADrainAsksForTheNextOne(FrappeTestCase):
+	"""A drain that creates more work -- publishing a product queues its stock and its price
+	-- has to get those sent without waiting for the safety net.
+
+	It did not. `schedule_drain` deduplicates on a job id, and Frappe refuses to queue a job
+	whose id is already QUEUED *or STARTED*. The drain making the request is itself that id,
+	started, so the request was dropped every time. Found on a live store: a published item
+	sat with its stock unsent until the once-a-minute cron came round, and on a machine with
+	no scheduler running it never went at all.
+	"""
+
+	def test_a_follow_on_does_not_deduplicate_against_itself(self):
+		from shopify_integration.sync import engine
+
+		with patch.object(engine.frappe, "enqueue") as enqueued:
+			engine.schedule_drain("ZZ Store", follow_on=True)
+
+		kwargs = enqueued.call_args.kwargs
+		self.assertFalse(kwargs["deduplicate"], "the running drain holds the plain id")
+		self.assertTrue(kwargs["job_id"].startswith("shopify_drain::ZZ Store::"))
+
+	def test_an_ordinary_request_still_deduplicates(self):
+		"""A burst of doc events must not spawn a job each."""
+		from shopify_integration.sync import engine
+
+		with patch.object(engine.frappe, "enqueue") as enqueued:
+			engine.schedule_drain("ZZ Store")
+
+		kwargs = enqueued.call_args.kwargs
+		self.assertTrue(kwargs["deduplicate"])
+		self.assertEqual(kwargs["job_id"], "shopify_drain::ZZ Store")
+
+	def test_a_drain_with_work_left_asks_for_another(self):
+		from shopify_integration.sync import engine
+
+		with (
+			patch.object(engine, "_drain_locked", return_value={"claimed": 1, "done": 1}),
+			patch.object(engine, "has_pending", return_value=True),
+			patch.object(engine, "schedule_drain") as again,
+		):
+			engine.drain_store("ZZ Store")
+
+		again.assert_called_once_with("ZZ Store", follow_on=True)

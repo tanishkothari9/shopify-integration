@@ -108,18 +108,29 @@ def enqueue_sync(
 	return doc.name
 
 
-def schedule_drain(store: str) -> None:
+def schedule_drain(store: str, *, follow_on: bool = False) -> None:
 	"""Ask for a drain of one store.
 
 	``deduplicate`` keeps a burst of enqueues from spawning a job each;
 	``enqueue_after_commit`` is mandatory -- without it a worker can pick the job up before
 	the transaction that wrote the row has committed, and push stale data or find nothing.
+
+	`follow_on` is for a drain asking for the next one, and it must not deduplicate.
+	Frappe refuses to queue a job whose id is already QUEUED *or STARTED*, and the drain
+	making the request is itself that id, started. So the request was silently dropped every
+	time -- the rows written during a drain waited for the once-a-minute safety net instead
+	of going straight out. Moving the call outside the filelock, which is where it used to
+	be, did not help: the lock was never what was holding the id.
 	"""
 	frappe.enqueue(
 		"shopify_integration.sync.engine.drain_store",
 		queue="short",
-		job_id=f"shopify_drain::{store}",
-		deduplicate=True,
+		job_id=(
+			f"shopify_drain::{store}::{frappe.generate_hash(length=8)}"
+			if follow_on
+			else f"shopify_drain::{store}"
+		),
+		deduplicate=not follow_on,
 		enqueue_after_commit=True,
 		store=store,
 	)
@@ -154,7 +165,7 @@ def drain_store(store: str, batch_size: int = DEFAULT_BATCH_SIZE) -> dict:
 	# the safety net. That is how an inventory push sat Pending from 21:47 until 22:00:
 	# correct in the end, thirteen minutes late.
 	if has_pending(store):
-		schedule_drain(store)
+		schedule_drain(store, follow_on=True)
 
 	return result
 
