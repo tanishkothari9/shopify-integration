@@ -207,7 +207,10 @@ class TestADrainDoesNotStrandWork(FrappeTestCase):
 		):
 			engine.drain_store("ZZ Store")
 
-		scheduled.assert_called_once_with("ZZ Store")
+		# follow_on, because the drain making the request holds the plain job id and Frappe
+		# refuses to queue a duplicate of a STARTED job -- which silently dropped every
+		# self-reschedule until it was fixed.
+		scheduled.assert_called_once_with("ZZ Store", follow_on=True)
 
 	def test_an_empty_queue_schedules_nothing(self):
 		from shopify_integration.sync import engine
