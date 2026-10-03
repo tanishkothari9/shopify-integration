@@ -44,6 +44,7 @@
   "column_break_inbound",
   "sync_delivery_notes",
   "sync_refunds",
+  "cancel_invoiced_orders",
   "section_outbound",
   "sync_inventory",
   "verify_stock_before_write",
@@ -472,6 +473,14 @@
    "label": "Verify Stock Before Writing",
    "depends_on": "sync_inventory",
    "description": "Read Shopify's current quantity before each stock write and refuse if it changed underneath us. Doubles the time a stock change takes to reach the shop, because it is a second round trip to Shopify. Only worth it if something other than this app also writes stock -- a second inventory app, or staff adjusting quantities in the Shopify admin. Shopify's own decrement at checkout does not count: ERPNext's figure is recomputed at the moment of writing, so the two converge without it."
+  },
+  {
+   "fieldname": "cancel_invoiced_orders",
+   "fieldtype": "Check",
+   "label": "Cancel Invoice And Payment On Cancellation",
+   "default": "0",
+   "depends_on": "sync_invoices",
+   "description": "Off by default. Cancelling a paid order in Shopify closes the Sales Order and releases its stock, but leaves the invoice and the payment standing, because the customer's money is still held until a refund is actually issued -- and cancelling the Payment Entry would leave ERPNext with no record of money it genuinely received. The refund webhook then credits the invoice as a return does. Tick this only if you would rather the invoice and payment were cancelled outright."
   }
  ],
  "index_web_pages_for_search": 1,

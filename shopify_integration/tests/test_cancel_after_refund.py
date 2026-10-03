@@ -213,7 +213,23 @@ class TestTheCancelHandlerItself(TestRecognisingTheSettledState):
 		self.assertEqual(frappe.db.get_value("Sales Invoice", invoice, "docstatus"), 1)
 		self.assertEqual(frappe.db.get_value("Sales Invoice", credit, "docstatus"), 1)
 
+	def _cancel_documents_too(self):
+		"""Opt this store back into tearing the books up, as a merchant may."""
+		frappe.db.set_value("Shopify Store", self.store, "cancel_invoiced_orders", 1)
+		frappe.db.commit()
+		self.addCleanup(frappe.db.commit)
+		self.addCleanup(
+			frappe.db.set_value, "Shopify Store", self.store, "cancel_invoiced_orders", 0
+		)
+
 	def test_a_cancel_of_an_order_closed_with_money_still_held_still_raises(self):
+		"""Only for a store that asked for the documents to be cancelled.
+
+		The throw exists to stop the app guessing at an order somebody closed by hand while
+		the money was still held. With the invoice left standing there is nothing to guess:
+		closing the order and saying so is the whole of the work.
+		"""
+		self._cancel_documents_too()
 		gid = "gid://shopify/Order/9402"
 		self._sales_order(gid, close=True)
 		invoice = self._invoice(gid)
@@ -226,8 +242,8 @@ class TestTheCancelHandlerItself(TestRecognisingTheSettledState):
 		self.assertEqual(frappe.db.get_value("Shopify Event Log", event, "status"), "Error")
 		self.assertEqual(frappe.db.get_value("Sales Invoice", invoice, "docstatus"), 1)
 
-	def test_an_ordinary_cancel_still_cancels_everything(self):
-		"""Cancel-first is unchanged: the order is open, so nothing short-circuits."""
+	def test_a_store_that_asks_for_it_still_cancels_everything(self):
+		self._cancel_documents_too()
 		gid = "gid://shopify/Order/9403"
 		name = self._sales_order(gid)
 		invoice = self._invoice(gid)
@@ -239,3 +255,169 @@ class TestTheCancelHandlerItself(TestRecognisingTheSettledState):
 		self.assertEqual(frappe.db.get_value("Shopify Event Log", event, "status"), "Success")
 		self.assertEqual(frappe.db.get_value("Sales Order", name, "docstatus"), 2)
 		self.assertEqual(frappe.db.get_value("Sales Invoice", invoice, "docstatus"), 2)
+
+	def test_an_order_with_no_invoice_is_still_cancelled_outright(self):
+		"""Nothing was booked, so there is no money to protect."""
+		gid = "gid://shopify/Order/9404"
+		name = self._sales_order(gid)
+		event = self._event(gid)
+
+		self._run_cancel(event, gid)
+
+		self.assertEqual(frappe.db.get_value("Sales Order", name, "docstatus"), 2)
+
+
+class TestCancellingAPaidOrderKeepsTheMoney(TestTheCancelHandlerItself):
+	"""Order #1002, 3 October: cancelled with "Refund later", and ERPNext lost the receipt.
+
+	Shopify's cancel dialog offers "Refund later". Choosing it cancels the order and keeps
+	the customer's money, and the app read that as permission to cancel the Payment Entry
+	and the Sales Invoice behind it -- so money genuinely received had no record at all.
+	"""
+
+	def _payment(self, invoice):
+		company = self._company()
+		doc = frappe.new_doc("Payment Entry")
+		doc.payment_type = "Receive"
+		doc.company = company
+		doc.party_type = "Customer"
+		doc.party = self.customer
+		doc.paid_from = frappe.db.get_value(
+			"Company", company, "default_receivable_account"
+		) or frappe.db.get_value("Account", {"company": company, "account_type": "Receivable", "is_group": 0}, "name")
+		doc.paid_to = frappe.db.get_value(
+			"Account", {"company": company, "account_type": "Bank", "is_group": 0}, "name"
+		) or frappe.db.get_value("Account", {"company": company, "account_type": "Cash", "is_group": 0}, "name")
+		total = frappe.db.get_value("Sales Invoice", invoice, "base_grand_total")
+		doc.paid_amount = doc.received_amount = total
+		doc.source_exchange_rate = doc.target_exchange_rate = 1
+		doc.reference_no, doc.reference_date = "SHOPIFY-TEST", frappe.utils.nowdate()
+		doc.append("references", {
+			"reference_doctype": "Sales Invoice", "reference_name": invoice,
+			"total_amount": total, "outstanding_amount": total, "allocated_amount": total,
+		})
+		doc.flags.ignore_mandatory = True
+		doc.insert(ignore_permissions=True)
+		doc.submit()
+		self.made.append(("Payment Entry", doc.name))
+		frappe.db.commit()
+		return doc.name
+
+	def test_the_invoice_and_the_payment_survive(self):
+		gid = "gid://shopify/Order/1002"
+		name = self._sales_order(gid)
+		invoice = self._invoice(gid)
+		payment = self._payment(invoice)
+		event = self._event(gid)
+
+		self._run_cancel(event, gid, order_name="#1002")
+
+		self.assertEqual(
+			frappe.db.get_value("Sales Invoice", invoice, "docstatus"), 1, "the invoice was torn up"
+		)
+		self.assertEqual(
+			frappe.db.get_value("Payment Entry", payment, "docstatus"),
+			1,
+			"money the shop actually received lost its only record",
+		)
+
+	def test_the_order_is_closed_so_the_stock_goes_back_on_sale(self):
+		gid = "gid://shopify/Order/1003"
+		name = self._sales_order(gid)
+		self._invoice(gid)
+		event = self._event(gid)
+
+		result = self._run_cancel(event, gid, order_name="#1003")
+
+		self.assertEqual(result["closed"], name)
+		self.assertEqual(frappe.db.get_value("Sales Order", name, "docstatus"), 1)
+		self.assertEqual(frappe.db.get_value("Sales Order", name, "status"), "Closed")
+
+	def test_money_still_held_is_reported_where_someone_will_see_it(self):
+		gid = "gid://shopify/Order/1004"
+		self._sales_order(gid)
+		self._invoice(gid, rate=250)
+		event = self._event(gid)
+
+		before = frappe.db.count("Error Log")
+		result = self._run_cancel(event, gid, order_name="#1004")
+
+		self.assertGreater(result["unrefunded"], 0)
+		self.assertGreater(frappe.db.count("Error Log"), before, "nothing was raised for a person")
+		self.assertIn("Refund pending", frappe.db.get_value("Shopify Event Log", event, "result"))
+
+	def test_an_open_order_whose_money_is_already_back_warns_about_nothing(self):
+		"""Refunded but never closed: close it, and say nothing about money owed."""
+		gid = "gid://shopify/Order/1005"
+		name = self._sales_order(gid)
+		invoice = self._invoice(gid)
+		self._invoice(gid, is_return=True, against=invoice)
+		event = self._event(gid)
+
+		result = self._run_cancel(event, gid, order_name="#1005")
+
+		self.assertEqual(result["closed"], name)
+		self.assertEqual(result["unrefunded"], 0)
+		self.assertNotIn("Refund pending", frappe.db.get_value("Shopify Event Log", event, "result"))
+
+	def test_a_refund_arriving_after_the_cancel_still_credits_the_invoice(self):
+		"""The case the old behaviour made impossible: cancel and refund together.
+
+		Cancelling used to cancel the invoice, so the refund that followed a moment later
+		had nothing left to credit. With the invoice standing, the refund books against it
+		exactly as it does for a return.
+		"""
+		gid = "gid://shopify/Order/1006"
+		self._sales_order(gid)
+		invoice = self._invoice(gid)
+		event = self._event(gid)
+
+		self._run_cancel(event, gid, order_name="#1006")
+		self.assertEqual(frappe.db.get_value("Sales Invoice", invoice, "docstatus"), 1)
+
+		# What the refund handler would do next: a credit note against a live invoice.
+		credit = self._invoice(gid, is_return=True, against=invoice)
+		self.assertEqual(frappe.db.get_value("Sales Invoice", credit, "docstatus"), 1)
+		self.assertEqual(
+			frappe.db.get_value("Sales Invoice", credit, "return_against"),
+			invoice,
+			"the credit note had nothing to point at",
+		)
+
+	def test_the_refund_is_not_skipped_as_already_cancelled(self):
+		"""The exact guard that used to swallow a refund arriving with its cancellation.
+
+		`_order_already_cancelled` reports True when every document for the order is
+		cancelled, and the refund handler then does nothing -- which was right while the
+		cancellation tore the invoice up, because there was genuinely nothing left to
+		credit. With the invoice standing it must report False, or the refund would be
+		silently dropped and the customer's money would never come back in the books.
+		"""
+		from shopify_integration.inbound.refund import _order_already_cancelled
+
+		gid = "gid://shopify/Order/1007"
+		self._sales_order(gid)
+		invoice = self._invoice(gid)
+		event = self._event(gid)
+
+		self._run_cancel(event, gid, order_name="#1007")
+
+		self.assertEqual(frappe.db.get_value("Sales Invoice", invoice, "docstatus"), 1)
+		self.assertFalse(
+			_order_already_cancelled(self.store, gid),
+			"the refund would have been skipped and the money never credited back",
+		)
+
+	def test_a_store_that_cancels_everything_does_skip_the_refund(self):
+		"""The other half: that behaviour is still right when the documents really are gone."""
+		from shopify_integration.inbound.refund import _order_already_cancelled
+
+		self._cancel_documents_too()
+		gid = "gid://shopify/Order/1008"
+		self._sales_order(gid)
+		self._invoice(gid)
+		event = self._event(gid)
+
+		self._run_cancel(event, gid, order_name="#1008")
+
+		self.assertTrue(_order_already_cancelled(self.store, gid))

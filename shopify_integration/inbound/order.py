@@ -137,16 +137,20 @@ def on_order_cancelled(event_log: str):
 	try:
 		order = fetch_order(log.store, payload_of(event_log))
 		gid = (order or {}).get("id") or _order_gid(payload_of(event_log))
-		closed = _closed_sales_order(log.store, gid)
-		if closed:
-			if _fully_refunded(log.store, gid):
-				# The refund webhook won the race and did all of this already: it credited the
-				# invoice, reversed the payment and closed the order. The books are right, and
-				# an invoice with its credit note is the correct record of a sale that was
-				# refunded -- tearing both up would lose the history and change nothing.
-				log.mark_skipped("order already fully refunded and closed in ERPNext; nothing to cancel")
-				return {"skipped": "already fully refunded and closed", "sales_order": closed}
 
+		closed = _closed_sales_order(log.store, gid)
+
+		if closed and _fully_refunded(log.store, gid):
+			# Checked before anything else. The refund webhook won the race and did all of
+			# this already: it credited the invoice, reversed the payment and closed the
+			# order. There is nothing left to close and nothing left to warn about.
+			log.mark_skipped("order already fully refunded and closed in ERPNext; nothing to cancel")
+			return {"skipped": "already fully refunded and closed", "sales_order": closed}
+
+		if _keeps_its_invoice(log.store, gid):
+			return _close_without_cancelling(log, order, gid)
+
+		if closed:
 			if _closed_by_refund(log.store, gid):
 				# Closed by `settle_after_refund`, not by a person: it closes an order as soon
 				# as nothing is still owed, which does not require the *money* to be fully
@@ -887,6 +891,93 @@ def _fully_refunded(store: str, order_gid: str | None) -> bool:
 		pluck="base_grand_total",
 	)
 	return bool(totals) and flt(sum(flt(total) for total in totals), 2) == 0
+
+
+def _keeps_its_invoice(store: str, order_gid: str | None) -> bool:
+	"""Whether this cancellation must leave the books alone.
+
+	Cancelling a paid order in Shopify says the goods are not coming. It says nothing about
+	the money, which the merchant still holds until a refund is actually issued -- choosing
+	"Refund later" in Shopify's own cancel dialog is exactly that. Tearing up the Payment
+	Entry then leaves ERPNext with no record of money it genuinely received, and the invoice
+	it paid gone with it. On 3 October order #1002 did precisely that to ACC-PAY-2026-21177
+	and SINV-26-22974.
+
+	So an order that has a submitted invoice keeps it. The Sales Order is closed, which is
+	what releases the stock, and the refund webhook credits the invoice later exactly as a
+	return does. A store that would rather have the old behaviour can ask for it.
+	"""
+	if not order_gid:
+		return False
+	if frappe.db.get_value("Shopify Store", store, "cancel_invoiced_orders"):
+		return False
+	return bool(
+		frappe.db.exists(
+			"Sales Invoice",
+			{
+				"shopify_store": store,
+				"shopify_order_gid": order_gid,
+				"is_return": 0,
+				"docstatus": 1,
+			},
+		)
+	)
+
+
+def _unrefunded_total(store: str, order_gid: str | None):
+	"""What this order's invoices still add up to, credit notes included.
+
+	Zero means the money is fully back and nothing is pending.
+	"""
+	totals = frappe.get_all(
+		"Sales Invoice",
+		filters={"shopify_store": store, "shopify_order_gid": order_gid, "docstatus": 1},
+		pluck="base_grand_total",
+	)
+	return flt(sum(flt(total) for total in totals), 2)
+
+
+def _close_without_cancelling(log, order: dict | None, order_gid: str | None) -> dict:
+	"""Release the order's stock and leave the money where it is.
+
+	Closing is what makes ERPNext recalculate `reserved_qty`, so the units a cancelled order
+	was holding go back on sale -- the whole point of reacting to the cancellation at all.
+	The Sales Order's own doc_event then pushes the freed stock to Shopify.
+	"""
+	name = frappe.db.get_value(
+		"Sales Order",
+		{"shopify_store": log.store, "shopify_order_gid": order_gid, "docstatus": 1},
+		"name",
+	)
+	if name and frappe.db.get_value("Sales Order", name, "status") not in ("Closed", "Completed"):
+		with inbound_write():
+			sales_order = frappe.get_doc("Sales Order", name)
+			mark(sales_order)
+			sales_order.update_status("Closed")
+		frappe.db.commit()
+
+	reference = (order or {}).get("name") or order_gid
+	pending = _unrefunded_total(log.store, order_gid)
+	note = f"Sales Order {name} closed; invoice and payment left standing." if name else (
+		"No Sales Order to close; invoice and payment left standing."
+	)
+
+	if pending > 0:
+		warning = (
+			f"Refund pending for order {reference}: {frappe.utils.fmt_money(pending)} is still "
+			f"invoiced and paid in ERPNext. Shopify cancelled the order without refunding, so "
+			f"the money is still held. The books will settle themselves when the refund is "
+			f"issued in Shopify; if it never is, credit the invoice by hand."
+		)
+		frappe.logger("shopify_integration").warning(warning)
+		# An Error Log entry, because a worker's log file is not somewhere anyone looks and
+		# money held against a cancelled order is exactly the thing that must not go unseen.
+		frappe.log_error(title=f"Shopify: refund pending for order {reference}", message=warning)
+		note = f"{note} {warning}"
+
+	frappe.db.commit()
+	log.mark_success(ref_doctype="Sales Order", ref_docname=name, result=note)
+	return {"closed": name, "unrefunded": pending, "cancelled": []}
 
 
 def cancel_linked_documents(store: str, order_gid: str | None) -> list[str]:
