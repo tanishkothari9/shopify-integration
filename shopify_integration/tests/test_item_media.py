@@ -735,3 +735,72 @@ class TestCarryingTheOldRecordOver(MediaCase):
 		execute()
 
 		self.assertEqual(owned_media(link.name), {})
+
+
+class TestTwoSyncsCannotBothUpload(MediaCase):
+	"""Found on a live store: a queued media row and a direct call overlapped, and the
+	product ended with six images where three belong -- only three in the ownership record,
+	the other three orphaned as the merchant's for ever, taking up room against the 250
+	ceiling and never removable by the app.
+
+	Everything in the sync reads the product's media, decides from it, then writes back, so
+	two of them running together both read "nothing uploaded yet" and both upload.
+	"""
+
+	def test_the_sync_is_held_behind_a_per_product_lock(self):
+		import inspect
+
+		from shopify_integration.outbound import media as module
+
+		source = inspect.getsource(module.sync_item_media)
+		self.assertIn("filelock", source)
+		self.assertIn("shopify-media-", source)
+		self.assertIn("_sync_media_unlocked", source)
+
+	def test_the_lock_is_per_product_not_global(self):
+		"""Two different products must still sync at the same time."""
+		import inspect
+
+		from shopify_integration.outbound import media as module
+
+		source = inspect.getsource(module.sync_item_media)
+		self.assertIn("{store_doc.name}-{subject}", source)
+
+	def test_a_second_sync_waits_rather_than_duplicating(self):
+		"""The behaviour, not the source: while one sync holds the lock, a second attempt
+		for the same product cannot proceed."""
+		from frappe.utils.file_lock import LockTimeoutError
+		from frappe.utils.synchronization import filelock
+
+		from shopify_integration.outbound.media import sync_item_media
+
+		code = self._item(image="/files/a.png")
+		self._link(code)
+		client = _Client()
+
+		# Patched down so the test does not sit out the real timeout.
+		with (
+			patch.object(media_module, "MEDIA_LOCK_TIMEOUT", 1),
+			filelock(f"shopify-media-{self.store}-{code}"[:120], timeout=1),
+		):
+			with self.assertRaises(LockTimeoutError):
+				sync_item_media(client, frappe.get_cached_doc("Shopify Store", self.store), code)
+
+		self.assertEqual(client.created, [], "the second sync must not have uploaded anything")
+
+	def test_a_different_product_is_not_blocked(self):
+		from frappe.utils.synchronization import filelock
+
+		from shopify_integration.outbound.media import sync_item_media
+
+		held = self._item(image="/files/b.png")
+		self._link(held)
+		other = self._item(image="/files/c.png")
+		self._link(other)
+		client = _Client()
+
+		# One product's lock held; the other must still go through.
+		with filelock(f"shopify-media-{self.store}-{held}"[:120], timeout=1):
+			result = sync_item_media(client, frappe.get_cached_doc("Shopify Store", self.store), other)
+
+		self.assertEqual(result.get("added"), 1)

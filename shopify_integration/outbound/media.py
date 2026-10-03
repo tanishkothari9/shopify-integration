@@ -34,6 +34,10 @@ MAX_MEDIA_PER_PRODUCT = 250
 #: Variants read per product. A product cannot have more than 100 variants either.
 VARIANT_PAGE = 100
 
+#: How long a second sync of the same product waits for the first to finish. Long enough
+#: to outlast a slow upload, short enough that a stuck lock does not hold a worker all day.
+MEDIA_LOCK_TIMEOUT = 60
+
 
 # --------------------------------------------------------------------------------------
 # What ERPNext says the product should have
@@ -257,7 +261,16 @@ def sync_item_media(client: ShopifyClient, store_doc, item_code: str) -> dict:
 	the main image first, and attaches each variant's image to that variant. Media the
 	merchant added in the Shopify admin is not in the app's record, so none of the three
 	touch it.
+
+	Held behind a lock per product, for the same reason creating one is. Everything below
+	reads the product's media, decides from it, and writes back -- so two of these running
+	together both read "no images yet" and both upload. Seen on a live store: a queued row
+	and a direct call overlapped and left six images where three belong, with only three in
+	the ownership record and the other three orphaned as the merchant's for ever, taking up
+	room against the 250 ceiling and never removable by the app.
 	"""
+	from frappe.utils.synchronization import filelock
+
 	from shopify_integration.outbound.product import product_link_for
 
 	if not store_doc.sync_item_images:
@@ -267,6 +280,13 @@ def sync_item_media(client: ShopifyClient, store_doc, item_code: str) -> dict:
 	link = product_link_for(store_doc.name, subject)
 	if not link or not link.product_gid:
 		return {"skipped": f"{subject} has no Shopify product"}
+
+	with filelock(f"shopify-media-{store_doc.name}-{subject}"[:120], timeout=MEDIA_LOCK_TIMEOUT):
+		return _sync_media_unlocked(client, store_doc, subject, link)
+
+
+def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -> dict:
+	"""The sync itself. Only ever called with the product's lock held."""
 
 	plan = media_plan(subject)
 	on_product = {node["id"]: node for node in _product_media_nodes(client, link.product_gid)}
