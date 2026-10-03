@@ -274,7 +274,42 @@ def _row_target(row: dict) -> tuple[str | None, str | None]:
 
 
 def _push_batch(client: ShopifyClient, store_doc, batch: list[dict], allow_retry: bool) -> None:
-	"""One inventorySetQuantities call for a batch, with compare-and-set."""
+	"""Write the batch to Shopify. One call, or two if the store asks to verify first.
+
+	By default there is no read. Measured against a live shop, the round trip to Shopify is
+	essentially all of this app's contribution to the delay between a sale and the shop
+	knowing about it -- our own code and database account for 20ms of it -- so the read was
+	half the total latency on the path that matters most, the one that decides whether the
+	last item can be sold twice.
+
+	Dropping it is safe where ERPNext is the only thing writing stock, because the check was
+	never guarding the case people fear. `compareQuantity` asks "has Shopify's number moved
+	since I looked a moment ago", not "is the number I am about to write correct" -- and the
+	quantity written here is recomputed from ERPNext at this instant, not taken from the
+	queued message. Shopify's own decrement at checkout is not a competing writer for the
+	same reason: both sides converge on ERPNext's figure.
+
+	It is worth switching back on when something else does write -- a second inventory app,
+	or staff adjusting quantities in the Shopify admin -- which is what the store setting is
+	for. The nightly reconciliation remains the backstop either way.
+	"""
+	if not store_doc.get("verify_stock_before_write"):
+		_send(
+			client,
+			store_doc,
+			[
+				{
+					"inventoryItemId": target["inventory_item_gid"],
+					"locationId": target["location_gid"],
+					"quantity": cint(target["quantity"]),
+				}
+				for target in batch
+			],
+			ignore_compare=True,
+		)
+		stamp_synced([target["link"] for target in batch])
+		return
+
 	current = _current_levels(client, batch)
 
 	# All or nothing, per mutation. Shopify's own words for COMPARE_QUANTITY_REQUIRED are

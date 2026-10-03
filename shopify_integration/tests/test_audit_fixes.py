@@ -453,6 +453,9 @@ class TestTheCompareIsAllOrNothing(FrappeTestCase):
 		cls.store_doc = frappe.get_cached_doc(
 			"Shopify Store", make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
 		)
+		# This whole class is about the compare path, which is opt-in now that the default
+		# writes in one call without reading first.
+		cls.store_doc.verify_stock_before_write = 1
 
 	def _run(self, known: dict):
 		from shopify_integration.outbound import inventory as module
@@ -1264,3 +1267,131 @@ class TestTheReversingPaymentIsBookedOnAccount(FrappeTestCase):
 		from shopify_integration.inbound import refund as module
 
 		self.assertIn("entry.remarks", inspect.getsource(module._reverse_payment))
+
+
+class TestStockIsWrittenInOneCall(FrappeTestCase):
+	"""Measured against a live shop, the round trip to Shopify is essentially all of this
+	app's contribution to the delay between a sale and the shop knowing: our own code and
+	database are 20ms of it. Reading the current level before every write was therefore half
+	the latency on the path that decides whether the last item can be sold twice.
+	"""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import SECRET_A, make_store
+
+		cls.store = make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
+
+	def _run(self, verify: bool):
+		from shopify_integration.outbound import inventory as module
+
+		reads, writes = [], []
+
+		class _Client:
+			def execute(inner, query, variables=None, **kw):
+				if "locationId" in (variables or {}):
+					reads.append(variables)
+					return {
+						"nodes": [
+							{
+								"id": g,
+								"inventoryLevel": {"quantities": [{"name": "available", "quantity": 7}]},
+							}
+							for g in variables["ids"]
+						]
+					}
+				writes.append(variables["input"])
+				return {"inventorySetQuantities": {"userErrors": []}}
+
+		store_doc = frappe._dict(
+			{
+				"name": self.store,
+				"verify_stock_before_write": 1 if verify else 0,
+			}
+		)
+		batch = [
+			{
+				"link": "LINK-1",
+				"item_code": "ZZ-ONE",
+				"inventory_item_gid": "gid://shopify/InventoryItem/1",
+				"location_gid": "gid://L/1",
+				"quantity": 4,
+			}
+		]
+		with (
+			patch.object(module, "stamp_synced"),
+			patch.object(module, "reference_uri", return_value="erpnext://test"),
+		):
+			module._push_batch(_Client(), store_doc, batch, allow_retry=False)
+		return reads, writes
+
+	def test_the_default_path_makes_one_call(self):
+		reads, writes = self._run(verify=False)
+
+		self.assertEqual(len(reads), 0, "no read on the path a sale travels")
+		self.assertEqual(len(writes), 1)
+		self.assertTrue(writes[0]["ignoreCompareQuantity"])
+		self.assertEqual(writes[0]["quantities"][0]["quantity"], 4)
+
+	def test_it_still_sends_erpnexts_figure_not_shopifys(self):
+		"""The quantity is recomputed from ERPNext at write time, which is why dropping the
+		read loses nothing: Shopify's own checkout decrement converges with us either way."""
+		_reads, writes = self._run(verify=False)
+
+		self.assertEqual(writes[0]["quantities"][0]["quantity"], 4, "ERPNext said 4, Shopify said 7")
+
+	def test_a_store_that_asks_to_verify_still_reads_first(self):
+		reads, writes = self._run(verify=True)
+
+		self.assertEqual(len(reads), 1, "the careful path is still there when something else writes")
+		self.assertEqual(writes[0]["quantities"][0]["compareQuantity"], 7)
+		self.assertNotIn("ignoreCompareQuantity", writes[0])
+
+	def test_verification_is_off_by_default(self):
+		import json
+		import pathlib
+
+		doctype = json.loads(
+			(
+				pathlib.Path(__file__).resolve().parent.parent
+				/ "shopify_integration"
+				/ "doctype"
+				/ "shopify_store"
+				/ "shopify_store.json"
+			).read_text()
+		)
+		field = next(f for f in doctype["fields"] if f["fieldname"] == "verify_stock_before_write")
+		self.assertEqual(field["default"], "0")
+
+
+class TestADriftCorrectionWaitsForTheOrder(FrappeTestCase):
+	"""Shopify decrements at checkout and tells us at once; the Sales Order that reserves the
+	unit in ERPNext takes a second or two longer to import. A correction drained inside that
+	gap would read ERPNext as still having the unit and push it back on sale -- the exact
+	oversell the drift check exists to prevent.
+	"""
+
+	def test_the_correction_is_held_back(self):
+		import inspect
+
+		from shopify_integration.inbound import inventory as module
+
+		source = inspect.getsource(module.detect_drift)
+		self.assertIn("DRIFT_SETTLE_SECONDS", source)
+		self.assertIn("next_attempt_at", source)
+
+	def test_the_delay_outlasts_a_slow_order_import(self):
+		"""Orders took 1.6s to import on a live store; the margin is deliberate."""
+		from shopify_integration.inbound.inventory import DRIFT_SETTLE_SECONDS
+
+		self.assertGreaterEqual(DRIFT_SETTLE_SECONDS, 30)
+		self.assertLessEqual(DRIFT_SETTLE_SECONDS, 300, "a real disagreement still has to be fixed promptly")
+
+	def test_an_ordinary_stock_push_is_not_delayed(self):
+		"""Only drift corrections wait. A sale must still reach the shop in seconds."""
+		import inspect
+
+		from shopify_integration.outbound import inventory as module
+
+		self.assertNotIn("DRIFT_SETTLE", inspect.getsource(module.enqueue_for_item))

@@ -301,8 +301,13 @@ class TestCompareAndSetConflictIsRetryable(InventoryTestCase):
 		self.assertIsInstance(ShopifyInventoryConflict("moved"), ShopifyUserError)
 
 	def test_a_persistent_mismatch_is_raised_as_a_conflict(self):
+		"""Only reachable on a store that asks to verify first -- the default path sends one
+		absolute write and has no compare to lose."""
 		from shopify_integration.exceptions import ShopifyInventoryConflict, ShopifyUserError
 		from shopify_integration.outbound import inventory as inventory_module
+
+		self.store_doc.verify_stock_before_write = 1
+		self.addCleanup(setattr, self.store_doc, "verify_stock_before_write", 0)
 
 		mismatch = ShopifyUserError(
 			"inventorySetQuantities rejected the write: "
@@ -340,6 +345,9 @@ class TestCompareAndSetConflictIsRetryable(InventoryTestCase):
 	def test_an_unrelated_user_error_is_still_permanent(self):
 		from shopify_integration.exceptions import ShopifyInventoryConflict, ShopifyUserError
 		from shopify_integration.outbound import inventory as inventory_module
+
+		self.store_doc.verify_stock_before_write = 1
+		self.addCleanup(setattr, self.store_doc, "verify_stock_before_write", 0)
 
 		class AlwaysRefuses:
 			def execute(self, query, variables, cost_hint=0):
