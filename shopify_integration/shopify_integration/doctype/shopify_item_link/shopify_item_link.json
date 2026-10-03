@@ -11,6 +11,7 @@
   "sku",
   "column_break_1",
   "is_variant",
+  "is_template",
   "template_item",
   "section_shopify",
   "product_gid",
@@ -150,6 +151,15 @@
    "read_only": 1,
    "length": 64,
    "description": "A hash of the Shopify fields this app maps onto the Item, as of the last webhook that changed anything. A products/update whose digest matches is Shopify echoing our own mutation back, and is dropped without saving the Item."
+  },
+  {
+   "fieldname": "is_template",
+   "fieldtype": "Check",
+   "label": "Is Template",
+   "read_only": 1,
+   "default": "0",
+   "search_index": 1,
+   "description": "This row is the variant template's own record of which Shopify product it owns, not a sellable variant: it carries a product_gid and no variant_gid. Before it existed a template's product could only be inferred backwards from its children's rows, so an echo that corrupted one child's template_item detached the whole range -- and disabling a single size then created a second Shopify product for it."
   }
  ],
  "index_web_pages_for_search": 1,

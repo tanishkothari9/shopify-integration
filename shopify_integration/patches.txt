@@ -5,3 +5,4 @@ shopify_integration.patches.v0_1.add_composite_indexes
 shopify_integration.patches.v0_1.rename_match_customers_setting
 shopify_integration.patches.v0_1.migrate_app_media
 shopify_integration.patches.v0_1.mark_initial_state_pushed
+shopify_integration.patches.v0_1.link_published_templates

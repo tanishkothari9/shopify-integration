@@ -237,7 +237,11 @@ def _write_variant_product(store: str, product: dict, options: list[dict], varia
 	"""Map a multi-option product to an ERPNext variant template plus its variant Items."""
 	attributes = [ensure_item_attribute(option) for option in options]
 
-	template_code = _template_already_linked(store, product) or template_item_code(product)
+	template_code = _template_already_linked(store, product)
+	if not template_code:
+		template_code = template_item_code(product)
+		_refuse_to_twin(store, product, template_code)
+
 	template = _upsert_template(template_code, product, attributes, item_group_for(product), store)
 
 	links = []
@@ -308,6 +312,42 @@ def _upsert_item(item_code: str, product: dict, variant: dict, item_group: str, 
 
 	_save_if_changed(item, before)
 	return item
+
+
+def _refuse_to_twin(store: str, product: dict, template_code: str) -> None:
+	"""Stop a product we already sell being imported as a second ERPNext range.
+
+	Reached only when nothing recognised the product -- no link, and no ERPNext items behind
+	its SKUs -- so the template is about to be named after the Shopify handle and created.
+	That is correct for a range this shop genuinely does not have. It is catastrophic for one
+	it does: on 3 October it gave SHOPIFY TEST A3 a twin with no variants, pulled the XL link
+	onto the twin, and the range stopped accepting sizes.
+
+	So before creating anything, ask the plainest question there is: does this shop already
+	have an item with one of these SKUs? If it does, something upstream is wrong -- the
+	resolution above should have found it -- and guessing is worse than stopping. The webhook
+	is marked failed with a message naming the collision, and the merchant's catalogue is
+	left exactly as it was.
+	"""
+	skus = [cstr(v.get("sku")).strip() for v in (product.get("variants") or [])]
+	skus = [sku for sku in skus if sku]
+	if not skus:
+		return
+
+	clashing = frappe.get_all("Item", filters={"name": ["in", skus]}, pluck="name")
+	if not clashing:
+		return
+
+	frappe.throw(
+		_(
+			"Shopify product {0} carries SKUs this shop already sells ({1}), but nothing links "
+			"it to an ERPNext range. Importing it would create a second template called {2} "
+			"and move those items onto it. Link the product to its range, or clear the SKUs on "
+			"Shopify, and retry this webhook."
+		).format(
+			product.get("id"), ", ".join(sorted(clashing)[:5]), template_code
+		)
+	)
 
 
 def _upsert_template(template_code: str, product: dict, attributes: list[str], item_group: str, store: str):
@@ -582,6 +622,39 @@ def _template_already_linked(store: str, product: dict) -> str | None:
 			f"templates ({', '.join(sorted(templates))}). Leaving it for someone to sort out "
 			"rather than guessing which range it is."
 		)
+		return None
+
+	# Last, and the only route that does not depend on a link existing yet.
+	#
+	# Publishing a template takes several calls -- create the product, create its variants,
+	# re-read them -- and the links are written at the end of all of it. Shopify fires
+	# products/create the instant the product exists, so the echo routinely arrives while
+	# that job is still running and there is not one link to find. Both routes above then
+	# come back empty, the template is named after the Shopify handle instead, and a second
+	# ERPNext template is created for a range that already has one. On 3 October that turned
+	# SHOPIFY TEST A3 into a twin with no variants and dragged the XL link onto it.
+	#
+	# The SKUs are the answer, and they are in the payload. They are this app's own item
+	# codes, so if ERPNext already has them as variants of one parent, that parent is the
+	# template -- whatever the links do or do not say yet.
+	parents = frappe.get_all(
+		"Item",
+		filters={"name": ["in", skus], "variant_of": ("is", "set")},
+		pluck="variant_of",
+		distinct=True,
+	)
+	parents = sorted(set(parents))
+	if len(parents) == 1:
+		frappe.logger("shopify_integration").info(
+			f"Recognised {gid or 'an incoming product'} as {parents[0]} from the ERPNext items "
+			"behind its SKUs; its links have not been written yet."
+		)
+		return parents[0]
+	if len(parents) > 1:
+		frappe.logger("shopify_integration").warning(
+			f"{gid or 'An incoming product'} carries SKUs from several ERPNext templates "
+			f"({', '.join(parents)}); leaving it rather than guessing."
+		)
 	return None
 
 
@@ -716,7 +789,18 @@ def ensure_item_attribute(option: dict) -> str:
 		attribute = frappe.new_doc("Item Attribute")
 		attribute.attribute_name = name
 
-	_append_values(attribute, option["values"])
+	added = _append_values(attribute, option["values"])
+	if not added and not attribute.is_new():
+		# Nothing to add, so nothing to save. Saving anyway rewrote `modified` on a document
+		# that every variant product in the catalogue shares -- in a clothing shop, Colour
+		# and Size are the two most shared documents there are. Two product webhooks a
+		# second apart then collided on an attribute neither of them was changing, and the
+		# loser died with "Document has been modified after you have opened it".
+		#
+		# It also meant an echo of this app's own publish rewrote the merchant's attribute
+		# list, which is theirs and not ours to touch.
+		return attribute.name
+
 	_assert_abbreviations_unique(attribute)
 	mark(attribute)
 	attribute.save(ignore_permissions=True)
@@ -737,14 +821,19 @@ def ensure_attribute_value(attribute_name: str, value: str) -> None:
 	if any(row.attribute_value == value for row in (attribute.item_attribute_values or [])):
 		return
 
-	_append_values(attribute, [value])
+	if not _append_values(attribute, [value]):
+		return
+
 	_assert_abbreviations_unique(attribute)
 	mark(attribute)
 	attribute.save(ignore_permissions=True)
 
 
-def _append_values(attribute, values: list[str]) -> None:
+def _append_values(attribute, values: list[str]) -> int:
 	"""Append values that are not already present, each with a non-colliding abbreviation.
+
+	Returns how many were actually added, so a caller can tell a real change from a no-op
+	and leave a shared document alone when there is nothing to write.
 
 	ERPNext requires abbreviations to be unique within an attribute, and it ships a "Size"
 	attribute whose "Small" value already occupies the abbreviation "S". A Shopify shop using
@@ -755,6 +844,7 @@ def _append_values(attribute, values: list[str]) -> None:
 	present = {row.attribute_value for row in rows}
 	taken = {cstr(row.abbr).upper() for row in rows}
 
+	added = 0
 	for value in values:
 		value = cstr(value).strip()
 		if not value or value in present:
@@ -763,6 +853,8 @@ def _append_values(attribute, values: list[str]) -> None:
 		taken.add(abbr)
 		present.add(value)
 		attribute.append("item_attribute_values", {"attribute_value": value, "abbr": abbr})
+		added += 1
+	return added
 
 
 def _assert_abbreviations_unique(attribute) -> None:

@@ -122,6 +122,10 @@ class TestTheStatusThatReachesShopify(FrappeTestCase):
 			patch.object(product_module, "_reread", return_value={"id": "gid://shopify/Product/1"}),
 			patch.object(product_module, "_link_variants"),
 			patch.object(product_module, "_link"),
+			# Stubbed with its siblings: this case is about which status reaches Shopify,
+			# and `frappe.get_doc` is patched above, which makes any real document write
+			# (including `frappe.new_doc`) impossible inside this block.
+			patch.object(product_module, "link_template"),
 			patch.object(product_module, "publish_to_online_store") as published,
 		):
 			product_module._create_product(_Client(), "Test Store A", "TPL")

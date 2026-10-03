@@ -1,0 +1,11 @@
+# Remove variants from a product without touching the product itself.
+#
+# The repair uses it to take a size off a range it was duplicated onto. Shopify refuses to
+# delete a product's last variant, which is the behaviour we want: a range with nothing left
+# to sell should be archived, not silently emptied.
+mutation ProductVariantsBulkDelete($productId: ID!, $variantsIds: [ID!]!) {
+  productVariantsBulkDelete(productId: $productId, variantsIds: $variantsIds) {
+    product { id }
+    userErrors { field message }
+  }
+}

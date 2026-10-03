@@ -1,0 +1,14 @@
+# Delete a whole Shopify product.
+#
+# Only ever used by the repair below, never by the sync: a product this app created by
+# mistake is the one thing it may remove, and a product the merchant made is not. Shopify
+# removes it from every collection and leaves past orders intact.
+#
+# `synchronous: true` so the caller knows it is gone before it rewrites any links; the
+# asynchronous mode returns a job and would have the repair reporting success too early.
+mutation ProductDelete($input: ProductDeleteInput!) {
+  productDelete(input: $input, synchronous: true) {
+    deletedProductId
+    userErrors { field message }
+  }
+}

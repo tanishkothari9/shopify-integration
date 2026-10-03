@@ -52,6 +52,8 @@ def on_item_change(doc, method=None):
 		# the document carrying the options the whole product is built from.
 		return
 
+	disabled_changed = bool(doc.get_doc_before_save()) and doc.has_value_changed("disabled")
+
 	for store in _stores_for(doc):
 		enqueue_sync(
 			store,
@@ -60,6 +62,15 @@ def on_item_change(doc, method=None):
 			ref_doctype="Item",
 			ref_docname=doc.name,
 		)
+
+		# Taking a size out of production moves no stock, so nothing else would ever tell
+		# Shopify about it. Without this the variant stayed on the storefront at its last
+		# known quantity and kept selling -- and because one disabled size rightly does not
+		# archive the whole range, nothing anywhere said otherwise.
+		if disabled_changed and not doc.get("has_variants"):
+			from shopify_integration.outbound.inventory import enqueue_for_all_locations
+
+			enqueue_for_all_locations(store, doc.name)
 
 	_republish_template_if_waiting(doc)
 
@@ -413,6 +424,11 @@ def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) 
 	if not product.get("id"):
 		return None
 
+	if item.get("has_variants"):
+		# Before the variants, not after them. Everything below this line takes seconds and
+		# makes API calls, and Shopify has already announced the product to us.
+		link_template(store, item_code, product["id"])
+
 	if children:
 		_create_variants(client, product["id"], children, store_doc, first=True)
 	else:
@@ -438,6 +454,12 @@ def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) 
 	from shopify_integration.outbound.collections import enqueue_for_item as enqueue_collection
 
 	enqueue_collection(store, item_code)
+
+	# And its photographs, here rather than only from `push_initial_state`. That runs from
+	# `upsert_link`, which a template never goes through -- its children do -- and asking
+	# whether a *variant* holds images is asking the wrong item: the range's photographs
+	# hang on the template. So a published template's picture was never sent at all.
+	enqueue_media(store, item_code)
 
 	frappe.logger("shopify_integration").info(
 		f"Published {item_code} to {store} as {product['id']}"
@@ -717,6 +739,49 @@ def _erpnext_holds_a_price(store: str, item_code: str) -> bool:
 	return _selling_price(item_code, store_doc) is not None
 
 
+def link_template(store: str, template_item: str, product_gid: str) -> str:
+	"""Record that this template owns this Shopify product.
+
+	Written the moment `productCreate` returns, and committed on the spot, because the gap
+	it closes is measured in seconds and another process has to see across it. Publishing a
+	template is several calls -- create the product, create its variants, re-read them --
+	and the variant links are written only at the end. Shopify fires products/create the
+	instant the product exists, and that webhook is handled by a different worker in a
+	different transaction, so it used to arrive when nothing whatsoever identified the
+	product as ours. The inbound writer then named a template after the Shopify handle and
+	built a second ERPNext template for a range that already had one.
+
+	A template's row carries a product and no variant: it has no Shopify variant of its own
+	to point at. `is_template` is what keeps it out of everything that walks links expecting
+	something sellable.
+	"""
+	existing = frappe.db.get_value(
+		"Shopify Item Link", {"store": store, "item_code": template_item}, "name"
+	)
+	if existing:
+		frappe.db.set_value(
+			"Shopify Item Link",
+			existing,
+			{"product_gid": product_gid, "is_template": 1, "is_variant": 0},
+			update_modified=False,
+		)
+		name = existing
+	else:
+		link = frappe.new_doc("Shopify Item Link")
+		link.store = store
+		link.item_code = template_item
+		link.product_gid = product_gid
+		link.is_template = 1
+		link.is_variant = 0
+		link.insert(ignore_permissions=True)
+		name = link.name
+
+	# The commit is the point. An uncommitted row is invisible to the webhook worker, which
+	# is the only reader that matters here.
+	frappe.db.commit()
+	return name
+
+
 def _link(store: str, item_code: str, product: dict) -> None:
 	from shopify_integration.catalogue.mapping import upsert_link
 
@@ -894,3 +959,172 @@ def _attach_to_published_template(client: ShopifyClient, store: str, item_code: 
 
 	frappe.logger("shopify_integration").info(f"Added {item_code} to the Shopify product for {template}")
 	return True
+
+
+# --------------------------------------------------------------------------------------
+# One-off repair
+# --------------------------------------------------------------------------------------
+
+
+def repair_split_template(
+	store: str,
+	template_item: str,
+	keep_product: str,
+	*,
+	drop_product: str | None = None,
+	drop_variants: list[str] | None = None,
+	drop_template: str | None = None,
+	apply: bool = False,
+) -> dict:
+	"""Put a range back on one Shopify product. Dry run unless `apply`.
+
+	Written for the 3 October fault, where publishing a template with three sizes produced a
+	second ERPNext template, and disabling one size then produced a second Shopify product
+	carrying the other two. The code that caused it is fixed; this is for the catalogues it
+	already split.
+
+	What it does, in this order, because the order matters:
+
+	1. points every variant link of `template_item` back at `keep_product`, and sets their
+	   `template_item` correctly -- including any dragged onto `drop_template`;
+	2. writes the template's own link row, which is what stops this happening again;
+	3. removes `drop_variants` (ERPNext item codes) from `keep_product` on Shopify;
+	4. deletes `drop_product` on Shopify, once nothing points at it any more;
+	5. removes `drop_template` from ERPNext, but only if it has no variants of its own.
+
+	Every step is reported before any of it runs. Nothing outside the ids named here is
+	touched, and a step whose target has already been cleaned up is skipped rather than
+	failing the rest.
+	"""
+	report: dict = {
+		"store": store,
+		"template": template_item,
+		"keep_product": keep_product,
+		"apply": apply,
+		"repointed": [],
+		"template_link": None,
+		"variants_removed": [],
+		"product_deleted": None,
+		"template_deleted": None,
+		"warnings": [],
+	}
+
+	if not frappe.db.exists("Item", template_item):
+		report["warnings"].append(f"{template_item} is not an Item on this site; nothing to repair.")
+		return report
+
+	# -- 1. every link that belongs to this range ------------------------------------
+	children = frappe.get_all("Item", filters={"variant_of": template_item}, pluck="name")
+	wanted = set(children) | {template_item}
+	if drop_template:
+		wanted |= set(frappe.get_all("Item", filters={"variant_of": drop_template}, pluck="name"))
+
+	links = frappe.get_all(
+		"Shopify Item Link",
+		filters={"store": store, "item_code": ["in", sorted(wanted)]},
+		fields=["name", "item_code", "product_gid", "template_item", "is_template"],
+	)
+	for link in links:
+		if link.is_template:
+			continue
+		if link.product_gid == keep_product and link.template_item == template_item:
+			continue
+		report["repointed"].append(
+			{
+				"link": link.name,
+				"item": link.item_code,
+				"from_product": link.product_gid,
+				"from_template": link.template_item,
+			}
+		)
+		if apply:
+			frappe.db.set_value(
+				"Shopify Item Link",
+				link.name,
+				{"product_gid": keep_product, "template_item": template_item},
+				update_modified=False,
+			)
+
+	# -- 2. the template's own row ----------------------------------------------------
+	existing_template_link = frappe.db.get_value(
+		"Shopify Item Link", {"store": store, "item_code": template_item}, "name"
+	)
+	report["template_link"] = existing_template_link or "would be created"
+	if apply:
+		report["template_link"] = link_template(store, template_item, keep_product)
+
+	client = ShopifyClient.for_store(store)
+
+	# -- 3. sizes that should not be on the kept product ------------------------------
+	for item_code in drop_variants or []:
+		variant_gid = frappe.db.get_value(
+			"Shopify Item Link", {"store": store, "item_code": item_code}, "variant_gid"
+		)
+		if not variant_gid:
+			report["warnings"].append(f"{item_code} has no variant on {store}; not removing it.")
+			continue
+		report["variants_removed"].append({"item": item_code, "variant": variant_gid})
+		report["warnings"].append(
+			f"{item_code}'s link is kept and re-pointed as asked, but its Shopify variant is "
+			f"being deleted -- the link will name a variant that no longer exists. Re-publish "
+			f"the size to recreate it, or delete the link if the size is gone for good."
+		)
+		if apply:
+			result = client.execute(
+				load_query("product_variants_bulk_delete"),
+				{"productId": keep_product, "variantsIds": [variant_gid]},
+				cost_hint=10,
+			)
+			errors = (result.get("productVariantsBulkDelete") or {}).get("userErrors") or []
+			if errors:
+				raise frappe.ValidationError(
+					f"Shopify refused to remove {item_code}: "
+					+ "; ".join(cstr(e.get("message")) for e in errors)
+				)
+
+	# -- 4. the duplicate product -----------------------------------------------------
+	if drop_product:
+		still_pointing = frappe.get_all(
+			"Shopify Item Link",
+			filters={"store": store, "product_gid": drop_product},
+			pluck="item_code",
+		)
+		report["product_deleted"] = {"product": drop_product, "links_cleared": still_pointing}
+		if apply:
+			for name in frappe.get_all(
+				"Shopify Item Link", filters={"store": store, "product_gid": drop_product}, pluck="name"
+			):
+				frappe.delete_doc("Shopify Item Link", name, force=True, ignore_permissions=True)
+			result = client.execute(
+				load_query("product_delete"), {"input": {"id": drop_product}}, cost_hint=10
+			)
+			errors = (result.get("productDelete") or {}).get("userErrors") or []
+			if errors:
+				raise frappe.ValidationError(
+					f"Shopify refused to delete {drop_product}: "
+					+ "; ".join(cstr(e.get("message")) for e in errors)
+				)
+
+	# -- 5. the twin ERPNext template -------------------------------------------------
+	if drop_template:
+		if not frappe.db.exists("Item", drop_template):
+			report["template_deleted"] = f"{drop_template} is already gone"
+		else:
+			remaining = frappe.get_all("Item", filters={"variant_of": drop_template}, pluck="name")
+			if remaining:
+				report["warnings"].append(
+					f"Not deleting {drop_template}: it still has variants ({', '.join(remaining[:5])}). "
+					"Those belong somewhere; sort them out first."
+				)
+			else:
+				report["template_deleted"] = drop_template
+				if apply:
+					for name in frappe.get_all(
+						"Shopify Item Link", filters={"item_code": drop_template}, pluck="name"
+					):
+						frappe.delete_doc("Shopify Item Link", name, force=True, ignore_permissions=True)
+					frappe.delete_doc("Item", drop_template, force=True, ignore_permissions=True)
+
+	if apply:
+		frappe.db.commit()
+	return report

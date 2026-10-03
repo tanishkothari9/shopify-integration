@@ -79,7 +79,22 @@ def available_for_location(store_doc, item_code: str, location_gid: str) -> int:
 
 	A group warehouse consolidates its descendants into one location (spec §5.2), so the
 	figure Shopify gets is the sum over all the warehouses feeding that location.
+
+	A disabled Item has nothing to sell, whatever its bins say. `_product_is_dead` leaves a
+	product alone when only one of its sizes is disabled -- rightly, the range is still for
+	sale -- on the stated understanding that the size itself stops being sellable "which its
+	own inventory push already handles". It did not: nothing here consulted `disabled`, so a
+	size taken out of production stayed on the storefront at its last known stock and went
+	on selling. This is where that understanding becomes true.
+
+	Deliberately here rather than in `available_quantity`, which is the raw per-warehouse
+	stock reading and should keep reporting what is physically on the shelf. This is the
+	figure Shopify is told, and the drift check compares against the same function, so both
+	now agree that a disabled item offers nothing.
 	"""
+	if frappe.db.get_value("Item", item_code, "disabled"):
+		return 0
+
 	total = 0
 	for warehouse in warehouses_for_location(store_doc, location_gid):
 		total += available_quantity(item_code, warehouse)
@@ -190,6 +205,24 @@ def enqueue_for_item(item_code: str, warehouse: str, ref_doctype: str, ref_docna
 # --------------------------------------------------------------------------------------
 # The push (spec §10.3)
 # --------------------------------------------------------------------------------------
+
+
+def enqueue_for_all_locations(store: str, item_code: str) -> int:
+	"""Queue an inventory push for one item at every location this store maps.
+
+	For changes that alter what may be sold without moving any stock -- disabling an item is
+	the one that matters -- where there is no warehouse in the triggering document to work
+	from.
+	"""
+	store_doc = frappe.get_cached_doc("Shopify Store", store)
+	if not store_doc.sync_inventory:
+		return 0
+
+	queued = 0
+	for row in store_doc.location_map or []:
+		if row.warehouse:
+			queued += enqueue_for_item(item_code, row.warehouse, "Item", item_code)
+	return queued
 
 
 def push_inventory(store: str, rows: list[dict]) -> None:

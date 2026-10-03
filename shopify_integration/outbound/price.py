@@ -34,7 +34,13 @@ def on_item_change(doc, method=None):
 
 	item_code = doc.name
 	for store in frappe.get_all(
-		"Shopify Item Link", filters={"item_code": item_code}, pluck="store", distinct=True
+		# `is_template` excluded: a template's row carries the product but no variant, and a
+		# price belongs to a variant. Including it queued a price row on every template save
+		# that `push_prices` could only skip.
+		"Shopify Item Link",
+		filters={"item_code": item_code, "is_template": 0},
+		pluck="store",
+		distinct=True,
 	):
 		store_doc = frappe.get_cached_doc("Shopify Store", store)
 		if not store_doc.sync_prices:
@@ -77,7 +83,13 @@ def on_price_change(doc, method=None):
 		return
 
 	for store in frappe.get_all(
-		"Shopify Item Link", filters={"item_code": item_code}, pluck="store", distinct=True
+		# `is_template` excluded: a template's row carries the product but no variant, and a
+		# price belongs to a variant. Including it queued a price row on every template save
+		# that `push_prices` could only skip.
+		"Shopify Item Link",
+		filters={"item_code": item_code, "is_template": 0},
+		pluck="store",
+		distinct=True,
 	):
 		store_doc = frappe.get_cached_doc("Shopify Store", store)
 		if not store_doc.sync_prices:
