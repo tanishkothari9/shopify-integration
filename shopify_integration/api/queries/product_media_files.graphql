@@ -1,0 +1,24 @@
+# A product's media with the CDN file behind each one.
+#
+# Separate from `product_media` because the sync does not need the URLs and this is charged
+# per node: the sync runs on every image change on every product, and this runs once, by
+# hand, to clean up after a fault.
+#
+# The URL is the only thing that says which ERPNext file a media came from. Shopify derives
+# the CDN filename from the `originalSource` it was uploaded with, so a duplicate upload of
+# the same file lands beside the original under a suffixed name -- which is what makes the
+# duplicates identifiable at all.
+query ProductMediaFiles($id: ID!) {
+  product(id: $id) {
+    id
+    media(first: 250) {
+      nodes {
+        ... on MediaImage {
+          id
+          status
+          image { url }
+        }
+      }
+    }
+  }
+}

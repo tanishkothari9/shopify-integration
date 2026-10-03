@@ -22,7 +22,9 @@
   "column_break_3",
   "price_synced_on",
   "online_store_publish_done",
-  "app_media"
+  "app_media",
+  "initial_state_pushed",
+  "inbound_digest"
  ],
  "fields": [
   {
@@ -132,6 +134,22 @@
    "label": "App Media",
    "read_only": 1,
    "description": "Which Shopify media this app created, as {file_url: media id}. It is the only thing that distinguishes an image the app uploaded from photography the merchant added in the Shopify admin, which is never moved or deleted."
+  },
+  {
+   "fieldname": "initial_state_pushed",
+   "fieldtype": "Check",
+   "label": "Initial State Pushed",
+   "read_only": 1,
+   "default": "0",
+   "description": "Set the moment this link's opening stock, price and images are queued -- not when those rows drain. The watermarks below are written on drain, which leaves a window where every inbound products/update re-queues the same three pushes; on 3 October that window produced 70 inventory, 69 price and 103 media rows for a single item."
+  },
+  {
+   "fieldname": "inbound_digest",
+   "fieldtype": "Data",
+   "label": "Inbound Digest",
+   "read_only": 1,
+   "length": 64,
+   "description": "A hash of the Shopify fields this app maps onto the Item, as of the last webhook that changed anything. A products/update whose digest matches is Shopify echoing our own mutation back, and is dropped without saving the Item."
   }
  ],
  "index_web_pages_for_search": 1,

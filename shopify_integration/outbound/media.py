@@ -16,10 +16,12 @@ started.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import frappe
-from frappe.utils import cstr, get_url
+from frappe.utils import cstr, get_datetime, get_url, now_datetime, time_diff_in_seconds
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.exceptions import PartialFailure
@@ -31,12 +33,21 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 #: Shopify's own ceiling on media per product.
 MAX_MEDIA_PER_PRODUCT = 250
 
+#: Media ids per `productDeleteMedia` call. The repair below can have hundreds to
+#: remove, and Shopify refuses a list that long in one go.
+MAX_DELETE_PER_CALL = 100
+
 #: Variants read per product. A product cannot have more than 100 variants either.
 VARIANT_PAGE = 100
 
 #: How long a second sync of the same product waits for the first to finish. Long enough
 #: to outlast a slow upload, short enough that a stuck lock does not hold a worker all day.
 MEDIA_LOCK_TIMEOUT = 60
+
+#: How long an upload has to be missing from the product's media before it is read
+#: as deleted rather than still landing. Shopify surfaces a new media within seconds;
+#: ten minutes is far past that and far short of a merchant noticing an image is back.
+MEDIA_SETTLE_SECONDS = 600
 
 
 # --------------------------------------------------------------------------------------
@@ -161,8 +172,15 @@ def media_plan(subject: str) -> dict:
 # --------------------------------------------------------------------------------------
 
 
-def owned_media(link_name: str) -> dict[str, str]:
-	"""file_url -> Shopify media id, for media this app created."""
+def read_record(link_name: str) -> dict[str, dict]:
+	"""file_url -> {"id": media gid, "at": when this app uploaded it}.
+
+	Two forms are read. The original was a bare `{file_url: gid}`; entries written from
+	now on carry the upload time beside the id, because that timestamp is the only thing
+	that distinguishes media Shopify has not listed *yet* from media the merchant has
+	deleted. An entry with no time is treated as long settled, which is the behaviour those
+	entries already had.
+	"""
 	raw = frappe.db.get_value("Shopify Item Link", link_name, "app_media")
 	if not raw:
 		return {}
@@ -170,17 +188,48 @@ def owned_media(link_name: str) -> dict[str, str]:
 		recorded = json.loads(raw)
 	except (TypeError, ValueError):
 		return {}
-	return {cstr(k): cstr(v) for k, v in recorded.items() if k and v} if isinstance(recorded, dict) else {}
+	if not isinstance(recorded, dict):
+		return {}
+
+	record = {}
+	for file_url, value in recorded.items():
+		if not file_url:
+			continue
+		if isinstance(value, dict):
+			gid, at = cstr(value.get("id")), cstr(value.get("at")) or None
+		else:
+			gid, at = cstr(value), None
+		if gid:
+			record[cstr(file_url)] = {"id": gid, "at": at}
+	return record
 
 
-def _record_owned(link_name: str, owned: dict[str, str]) -> None:
+def owned_media(link_name: str) -> dict[str, str]:
+	"""file_url -> Shopify media id, for media this app created."""
+	return {file_url: entry["id"] for file_url, entry in read_record(link_name).items()}
+
+
+def _record_owned(link_name: str, record: dict[str, dict]) -> None:
 	frappe.db.set_value(
 		"Shopify Item Link",
 		link_name,
 		"app_media",
-		json.dumps(owned, indent=0, sort_keys=True) if owned else None,
+		json.dumps(record, indent=0, sort_keys=True) if record else None,
 		update_modified=False,
 	)
+
+
+def _settled(at: str | None) -> bool:
+	"""Whether enough time has passed that Shopify would be listing this media by now.
+
+	Before this, an absence is Shopify being slow. After it, an absence is a deletion.
+	"""
+	if not at:
+		return True
+	try:
+		return time_diff_in_seconds(now_datetime(), get_datetime(at)) > MEDIA_SETTLE_SECONDS
+	except Exception:
+		return True
 
 
 # --------------------------------------------------------------------------------------
@@ -291,22 +340,47 @@ def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -
 	plan = media_plan(subject)
 	on_product = {node["id"]: node for node in _product_media_nodes(client, link.product_gid)}
 
-	# Media the merchant deleted in Shopify is no longer ours to account for.
-	owned = {url: gid for url, gid in owned_media(link.name).items() if gid in on_product}
+	# The record exactly as written. Nothing still in it is ever uploaded a second time,
+	# which is the single rule that keeps this idempotent -- see `sources` below.
+	record = read_record(link.name)
+
+	# An entry Shopify is not showing is one of two things, and they look identical:
+	# media this app created moments ago that has not surfaced on the product yet, or
+	# media the merchant deleted in the admin. Only time tells them apart.
+	#
+	# Reading every absence as the second produced 202 images on one product: each pass
+	# could not yet see the three it had just uploaded, concluded it owned nothing,
+	# uploaded them again, and left the previous copies behind as the merchant's for ever.
+	# Reading every absence as the first would be the opposite mistake -- an image the
+	# merchant deleted would never come back, silently, and this app's whole claim is that
+	# the shop shows what ERPNext holds.
+	for file_url, entry in list(record.items()):
+		if entry["id"] not in on_product and _settled(entry["at"]):
+			record.pop(file_url)
+
+	recorded = {file_url: entry["id"] for file_url, entry in record.items()}
+
+	# The part of the record Shopify is showing right now. Everything destructive below is
+	# limited to this; nothing below decides what to *upload* from it.
+	live = {url: gid for url, gid in recorded.items() if gid in on_product}
 
 	failures = []
 
 	# Processing is asynchronous, so a FAILED image is only ever discovered on a later pass.
 	# Taking it down and forgetting it is what lets a corrected file be uploaded again; the
 	# reason is reported so a file Shopify will never accept does not just vanish quietly.
-	failed = {url: gid for url, gid in owned.items() if cstr(on_product[gid].get("status")) == "FAILED"}
+	failed = {url: gid for url, gid in live.items() if cstr(on_product[gid].get("status")) == "FAILED"}
 	for url, gid in failed.items():
 		reason = _readable(on_product[gid].get("mediaErrors") or []) or "Shopify gave no reason"
 		failures.append(f"{subject}: Shopify could not process {url} -- {reason}")
-		owned.pop(url, None)
+		live.pop(url, None)
+		recorded.pop(url, None)
+		record.pop(url, None)
 
 	# Merchant media counts against the ceiling too, so what is left is what the app may use.
-	theirs = [gid for gid in on_product if gid not in owned.values()]
+	# Measured against the whole record, not just the visible part: media in flight is ours
+	# and must not be counted as somebody else's.
+	theirs = [gid for gid in on_product if gid not in recorded.values()]
 	room = max(MAX_MEDIA_PER_PRODUCT - len(theirs), 0)
 	wanted = plan["order"][:room]
 	if len(plan["order"]) > room:
@@ -315,7 +389,9 @@ def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -
 			f"Shopify's limit of {MAX_MEDIA_PER_PRODUCT} media, {len(theirs)} of them added in Shopify."
 		)
 
-	to_delete = [gid for url, gid in owned.items() if url not in wanted] + list(failed.values())
+	# From `live` only: a media id Shopify is not showing cannot be deleted, and asking it
+	# to be is how a perfectly good upload gets reported as a failure.
+	to_delete = [gid for url, gid in live.items() if url not in wanted] + list(failed.values())
 	if to_delete:
 		result = client.execute(
 			load_query("product_delete_media"),
@@ -332,11 +408,15 @@ def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -
 		# record of, reads it as the merchant's own, and will never delete it or count it
 		# against the ceiling again.
 		gone = set(payload.get("deletedMediaIds") or [])
-		owned = {url: gid for url, gid in owned.items() if gid not in gone}
+		live = {url: gid for url, gid in live.items() if gid not in gone}
+		recorded = {url: gid for url, gid in recorded.items() if gid not in gone}
+		record = {url: entry for url, entry in record.items() if entry["id"] not in gone}
 
 	sources = []
 	for file_url in wanted:
-		if file_url in owned or file_url in failed:
+		# Against the whole record, including media Shopify has not surfaced yet. A file
+		# this app has already uploaded is never uploaded again, PROCESSING or not.
+		if file_url in recorded or file_url in failed:
 			# Not `failed`: Shopify has just told us it cannot process that exact file, and
 			# sending it again in the same breath would only fail again. The record of it is
 			# gone, so the next thing that touches the item tries once more -- which is what
@@ -348,11 +428,25 @@ def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -
 			sources.append((file_url, url))
 
 	created = _create(client, link.product_gid, sources, subject)
-	owned.update(created)
-	_record_owned(link.name, owned)
+	stamp = cstr(now_datetime())
+	for file_url, gid in created.items():
+		record[file_url] = {"id": gid, "at": stamp}
+	_record_owned(link.name, record)
 
-	_feature_the_main_image(client, link.product_gid, wanted, owned, on_product, created)
-	attached = _attach_to_variants(client, store_doc.name, link.product_gid, plan, owned)
+	# Committed here, against the usual rule that a handler leaves committing to the drain.
+	# Ownership has to outlive anything that can fail after this point: the two calls below
+	# both can, and a rollback that takes the record with it leaves the images on Shopify
+	# with nothing claiming them. They then read as the merchant's own for ever -- never
+	# deleted, never replaced, and counted against the 250 ceiling.
+	if created:
+		frappe.db.commit()
+
+	# Only what Shopify is known to be holding: what it was already showing, plus what it
+	# has just confirmed creating. Anything still in flight is left for the next pass, so
+	# neither call can be asked to reorder or attach a media id Shopify will not accept yet.
+	usable = {**live, **created}
+	_feature_the_main_image(client, link.product_gid, wanted, usable, on_product, created)
+	attached = _attach_to_variants(client, store_doc.name, link.product_gid, plan, usable)
 
 	return {
 		"added": len(created),
@@ -530,3 +624,109 @@ def on_file_change(doc, method=None) -> None:
 	if not frappe.db.exists("Item", item_code):
 		return
 	enqueue_for_item(item_code)
+
+
+# --------------------------------------------------------------------------------------
+# One-off repair
+# --------------------------------------------------------------------------------------
+
+
+def _stem(url: str) -> str:
+	"""The filename behind a URL, without its query string or extension, lowercased."""
+	path = urlparse(cstr(url)).path
+	return Path(path).stem.lower()
+
+
+#: Shopify will not hold two files under one name, so a re-upload of the same file lands as
+#: `saree-red_a1b2c3.jpg` or `saree-red_2.jpg` beside the original `saree-red.jpg`. This is
+#: what recognises the second as a copy of the first.
+_SUFFIXED = re.compile(r"^(?P<stem>.+?)_[0-9a-f]{4,}$|^(?P<numbered>.+?)_\d{1,3}$", re.IGNORECASE)
+
+
+def _original_stem(stem: str) -> str:
+	match = _SUFFIXED.match(stem)
+	if not match:
+		return stem
+	return match.group("stem") or match.group("numbered") or stem
+
+
+def prune_duplicate_media(store: str, item_code: str, apply: bool = False) -> dict:
+	"""Remove copies of this app's own images from one product. Dry run unless `apply`.
+
+	Written for the 3 October fault, where a product finished with 202 media against three
+	owned records: every pass re-uploaded the same three files because it could not yet see
+	the ones it had just created, and each previous copy was left behind looking like the
+	merchant's own photography -- never deleted, never replaced, counted against Shopify's
+	ceiling of 250 for ever.
+
+	The loop itself is fixed; this clears up after it. A media is only ever a candidate when
+	its CDN filename is the app's own file under one of Shopify's duplicate suffixes, and
+	the media actually recorded in `app_media` is always kept. Anything whose name this does
+	not recognise is the merchant's and is not touched.
+
+	Scoped to the single item asked for. There is no "every product" form on purpose: this
+	deletes things, it was written in a hurry for one fault, and a typo must not be able to
+	strip a catalogue.
+
+	Run it with::
+
+	    bench --site <site> execute shopify_integration.outbound.media.prune_duplicate_media \\
+	        --kwargs "{'store': 'Lunar India', 'item_code': 'STOITEM202605581'}"
+
+	and again with ``'apply': True`` once the list reads correctly.
+	"""
+	from shopify_integration.outbound.product import product_link_for
+
+	store_doc = frappe.get_cached_doc("Shopify Store", store)
+	subject = product_subject(item_code)
+	link = product_link_for(store, subject)
+	if not link or not link.product_gid:
+		return {"error": f"{subject} has no Shopify product on {store}"}
+
+	client = ShopifyClient.for_store(store)
+	recorded = owned_media(link.name)
+	keep = set(recorded.values())
+	ours = {_original_stem(_stem(url)) for url in recorded}
+
+	data = client.execute(load_query("product_media_files"), {"id": link.product_gid}, cost_hint=10)
+	nodes = [n for n in (((data.get("product") or {}).get("media") or {}).get("nodes") or []) if n.get("id")]
+
+	duplicates = []
+	for node in nodes:
+		if node["id"] in keep:
+			continue
+		stem = _stem((node.get("image") or {}).get("url"))
+		if stem and _original_stem(stem) in ours:
+			duplicates.append({"id": node["id"], "file": stem, "status": node.get("status")})
+
+	report = {
+		"product": link.product_gid,
+		"item_code": subject,
+		"media_on_product": len(nodes),
+		"recorded_as_ours": len(recorded),
+		"duplicates": duplicates,
+		"applied": False,
+	}
+	if not duplicates or not apply:
+		return report
+
+	# In Shopify's own batches rather than one call of 199 ids, which it refuses.
+	deleted = []
+	ids = [d["id"] for d in duplicates]
+	for start in range(0, len(ids), MAX_DELETE_PER_CALL):
+		batch = ids[start : start + MAX_DELETE_PER_CALL]
+		result = client.execute(
+			load_query("product_delete_media"),
+			{"productId": link.product_gid, "mediaIds": batch},
+			cost_hint=10 + len(batch),
+		)
+		payload = result.get("productDeleteMedia") or {}
+		errors = payload.get("mediaUserErrors") or []
+		if errors:
+			raise MediaSyncError(f"{subject}: Shopify refused to remove a copy -- {_readable(errors)}")
+		deleted.extend(payload.get("deletedMediaIds") or [])
+
+	frappe.db.commit()
+	report["applied"] = True
+	report["deleted"] = len(deleted)
+	return report

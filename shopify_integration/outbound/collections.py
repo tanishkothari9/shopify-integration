@@ -34,6 +34,7 @@ import frappe
 from frappe.utils import cstr, flt
 
 from shopify_integration.api.client import ShopifyClient, load_query
+from shopify_integration.catalogue.echo import is_echo
 from shopify_integration.exceptions import PartialFailure
 from shopify_integration.outbound.price import current_price
 
@@ -148,12 +149,23 @@ def enqueue_for_item(store: str, item_code: str, *, sweep: bool = False) -> str 
 
 
 def on_item_change(doc, method=None):
-	"""Item saved: its group or its own tax rows may have moved it to another band."""
+	"""Item saved: its group or its own tax rows may have moved it to another band.
+
+	Echo-gated like every other outbound hook. Without this, an Item written by a
+	`products/update` webhook queued a collection sync, that sync called `productUpdate`,
+	Shopify echoed another `products/update`, and the two fed each other: 105 collection
+	rows for one product in the eight minutes it ran on 3 October. Every sibling hook
+	already checked; this one was simply missed.
+	"""
+	if is_echo(doc):
+		return
 	_enqueue_for_stores(doc.name)
 
 
 def on_price_change(doc, method=None):
 	"""Item Price saved: the price is what decides the band."""
+	if is_echo(doc):
+		return
 	_enqueue_for_stores(doc.get("item_code"), price_list=doc.get("price_list"))
 
 

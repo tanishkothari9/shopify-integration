@@ -12,7 +12,11 @@ from frappe import _
 
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import inbound_write
-from shopify_integration.catalogue.mapping import write_product_mapping
+from shopify_integration.catalogue.mapping import (
+	product_digest,
+	stored_digest,
+	write_product_mapping,
+)
 from shopify_integration.inbound.webhook import payload_of
 
 
@@ -128,6 +132,25 @@ def _upsert_from_webhook(event_log: str):
 			)
 
 		product["variants"] = [edge["node"] for edge in (variants.get("edges") or [])]
+
+		# Shopify echoes a products/update back for everything this app does to a product --
+		# every price write, every inventory write, every image upload, every collection
+		# move. Handling one means saving the Item, and saving the Item fires the doc_events
+		# that queue the next mutation, which earns the next webhook. On 3 October that
+		# circle ran for eight minutes on one item: 139 webhooks, 347 queue rows and 202
+		# media where three belong.
+		#
+		# The digest is what breaks it. It covers only the fields this app maps, so a
+		# webhook whose digest already matches carries nothing for ERPNext and is dropped
+		# here -- before the Item is touched, before anything is queued.
+		digest = product_digest(product)
+		if digest and digest == stored_digest(log.store, product_gid):
+			log.mark_success(
+				ref_doctype="Shopify Item Link",
+				ref_docname=None,
+				result="No mapped field changed; this is Shopify echoing our own write back.",
+			)
+			return {"skipped": "no mapped field changed"}
 
 		result = _write_with_retry(log.store, product)
 		frappe.db.commit()

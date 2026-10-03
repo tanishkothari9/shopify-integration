@@ -647,10 +647,10 @@ def push_initial_state(store: str, item_code: str) -> None:
 	link = frappe.db.get_value(
 		"Shopify Item Link",
 		{"store": store, "item_code": item_code},
-		["inventory_synced_on", "price_synced_on"],
+		["name", "initial_state_pushed", "inventory_synced_on", "price_synced_on"],
 		as_dict=True,
 	)
-	if not link:
+	if not link or link.initial_state_pushed:
 		return
 
 	if not link.inventory_synced_on and _erpnext_holds_stock(store, item_code):
@@ -662,6 +662,19 @@ def push_initial_state(store: str, item_code: str) -> None:
 	# order to discover that is a cost with nothing at the end of it.
 	if _erpnext_holds_images(item_code):
 		enqueue_media(store, item_code)
+
+	# Written here, not when those rows drain. The two watermarks above are stamped on
+	# drain, and media had no watermark at all, so every `products/update` that arrived in
+	# the meantime queued the same three pushes again -- each of which mutates the product,
+	# each of which makes Shopify send another `products/update`. That is the loop, and the
+	# marker is what ends it: one link, one opening push, whatever calls this afterwards.
+	#
+	# After the enqueues rather than before, so a failure to queue is retried rather than
+	# swallowed. Two callers racing both enqueue, and `enqueue_sync` collapses them on the
+	# dedupe key, which is the behaviour this relied on before and still does.
+	frappe.db.set_value(
+		"Shopify Item Link", link.name, "initial_state_pushed", 1, update_modified=False
+	)
 
 
 def _erpnext_holds_images(item_code: str) -> bool:

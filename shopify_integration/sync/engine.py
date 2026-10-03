@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 import frappe
-from frappe.utils import get_site_path, now_datetime
+from frappe.utils import cstr, get_site_path, now_datetime
 from frappe.utils.file_lock import LockTimeoutError
 
 from shopify_integration.exceptions import PartialFailure
@@ -53,6 +53,128 @@ SWEEP_PRIORITY = 2
 
 PRIORITY_BY_OPERATION: dict[str, int] = {"inventory": REALTIME_PRIORITY}
 
+#: How many rows of one operation, for one item, inside the window below before this stops
+#: being a busy product and starts being a loop. Ten is comfortably above anything honest:
+#: the dedupe key already collapses a burst of edits into a single Pending row, so ten rows
+#: means ten separate drains each earning another enqueue.
+BREAKER_MAX_ROWS = 10
+
+#: The window those rows are counted over.
+BREAKER_WINDOW_SECONDS = 300
+
+#: How long that one operation stays blocked for that one item once the breaker trips.
+#: Everything else about the item -- and every other item -- keeps syncing. It clears by
+#: itself, because a loop whose cause has been fixed should not need anyone to come and
+#: unlatch it, and the alert is what makes sure the trip was not missed.
+BREAKER_COOLDOWN_SECONDS = 3600
+
+#: Operations the breaker will not stop, however often they are queued.
+#:
+#: Inventory, and only inventory. A breaker is a trade: it spends correctness to contain a
+#: fault. For a listing that is the right trade -- a title an hour stale harms nobody. For
+#: stock it is the wrong one, because the harm the block causes is the harm the app exists
+#: to prevent: Shopify keeps selling units ERPNext knows are gone.
+#:
+#: And a run of inventory rows is not even good evidence of a loop. Eleven sales of one SKU
+#: inside five minutes is a flash sale, not a fault, and it is exactly when stopping would
+#: cost the most. An inventory push is convergent besides -- it sends the level that is
+#: true now, not a delta -- so a loop of them wastes API budget and corrupts nothing, while
+#: the throttle already bounds what that waste can cost.
+BREAKER_EXEMPT_OPERATIONS = frozenset({"inventory"})
+
+
+def _breaker_keys(store: str, operation: str, subject: str) -> tuple[str, str]:
+	base = f"shopify_breaker:{store}:{operation}:{subject}"
+	return f"{base}:count", f"{base}:open"
+
+
+def clear_breaker(store: str, operation: str, subject: str) -> None:
+	"""Let this operation run for this item again, now rather than when the cooldown ends."""
+	count_key, open_key = _breaker_keys(store, operation, subject)
+	cache = frappe.cache()
+	cache.delete_value(count_key)
+	cache.delete_value(open_key)
+
+
+def breaker_is_open(store: str, operation: str, subject: str) -> bool:
+	_, open_key = _breaker_keys(store, operation, subject)
+	return bool(_read_flag(open_key))
+
+
+def _read_flag(open_key: str):
+	"""Read the breaker flag past Frappe's per-request memo.
+
+	`expires=True` is load-bearing. Without it `get_value` writes whatever it found into
+	`frappe.local.cache`, including a miss -- so the very first check of a breaker that is
+	closed poisons every later check in the same job with that `None`, and the flag set a
+	moment afterwards is never seen. `set_value` with `expires_in_sec` writes only to Redis
+	and never to that memo, which is what makes the two disagree.
+	"""
+	return frappe.cache().get_value(open_key, expires=True)
+
+
+def _breaker_blocks(store: str, operation: str, subject: str) -> bool:
+	"""Whether this operation is currently stopped for this item.
+
+	Fails open. A cache that is down must slow nothing and block nothing -- the breaker
+	exists to contain a fault, not to become one.
+	"""
+	if not subject or operation in BREAKER_EXEMPT_OPERATIONS:
+		return False
+	_, open_key = _breaker_keys(store, operation, subject)
+	try:
+		return bool(_read_flag(open_key))
+	except Exception:
+		frappe.logger("shopify_integration").warning(
+			"Sync breaker could not reach the cache; allowing the enqueue.", exc_info=True
+		)
+		return False
+
+
+def _breaker_count(store: str, operation: str, subject: str) -> None:
+	"""Count a row that was actually written, and trip if there have been too many.
+
+	Rows, not attempts. An enqueue that coalesces into an existing Pending row is the
+	queue working -- one row is standing in for the burst, and counting those would trip
+	the breaker on a busy product rather than a looping one.
+
+	Counted in Redis rather than by querying the queue table: this runs inside whatever
+	save asked for the sync, including a sale at the POS counter, and that path may not
+	grow a `COUNT(*)` over a table the size of the queue.
+	"""
+	if not subject or operation in BREAKER_EXEMPT_OPERATIONS:
+		return
+
+	count_key, open_key = _breaker_keys(store, operation, subject)
+	try:
+		cache = frappe.cache()
+		seen = cache.incrby(cache.make_key(count_key), 1)
+		if seen == 1:
+			cache.expire(cache.make_key(count_key), BREAKER_WINDOW_SECONDS)
+		if seen <= BREAKER_MAX_ROWS:
+			return
+		cache.set_value(open_key, 1, expires_in_sec=BREAKER_COOLDOWN_SECONDS)
+	except Exception:
+		frappe.logger("shopify_integration").warning(
+			"Sync breaker could not reach the cache; not counting this row.", exc_info=True
+		)
+		return
+
+	message = (
+		f"{subject} has queued {seen} {operation} syncs for {store} in under "
+		f"{BREAKER_WINDOW_SECONDS // 60} minutes, which is a feedback loop rather than a busy "
+		f"product. Further {operation} syncs for this item are blocked for "
+		f"{BREAKER_COOLDOWN_SECONDS // 60} minutes; everything else about it, and every other "
+		f"item, is unaffected.\n\n"
+		f"Clear it early with:\n"
+		f"    shopify_integration.sync.engine.clear_breaker({store!r}, {operation!r}, {subject!r})"
+	)
+	frappe.logger("shopify_integration").error(message)
+	# An Error Log entry, because a logger line in a worker's file is not somewhere anyone
+	# looks. This is the alert.
+	frappe.log_error(title=f"Shopify sync loop stopped: {operation} on {subject}", message=message)
+
+
 OPERATION_HANDLERS: dict[str, str] = {
 	"inventory": "shopify_integration.outbound.inventory.push_inventory",
 	"product": "shopify_integration.outbound.product.push_products",
@@ -77,8 +199,13 @@ def enqueue_sync(
 	Called from doc_events, so it must be cheap and must never touch the network. It runs
 	inside the user's save transaction -- including at the POS counter.
 
-	Returns the row name, or None when coalesced into an existing Pending row.
+	Returns the row name, or None when coalesced into an existing Pending row, or None
+	when the circuit breaker has this item's operation stopped.
 	"""
+	subject = cstr(ref_docname)
+	if _breaker_blocks(store, operation, subject):
+		return None
+
 	doc = frappe.new_doc("Shopify Sync Queue")
 	doc.store = store
 	doc.operation = operation
@@ -104,6 +231,7 @@ def enqueue_sync(
 			return None
 		raise
 
+	_breaker_count(store, operation, subject)
 	schedule_drain(store)
 	return doc.name
 

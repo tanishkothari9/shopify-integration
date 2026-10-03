@@ -10,6 +10,9 @@ back to Shopify.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import frappe
 from frappe import _
 from frappe.utils import cstr, flt
@@ -32,6 +35,147 @@ WEIGHT_UOM = {
 DEFAULT_OPTION_TITLE = "Title"
 DEFAULT_OPTION_VALUE = "Default Title"
 
+#: Fields on a document that move by themselves and say nothing about whether its content
+#: did. Stripped before two states of an Item are compared.
+VOLATILE_KEYS = frozenset(
+	{
+		"modified",
+		"modified_by",
+		"creation",
+		"owner",
+		"name",
+		"parent",
+		"idx",
+		"docstatus",
+		"doctype",
+		"parentfield",
+		"parenttype",
+		"__islocal",
+		"__unsaved",
+		"__last_sync_on",
+	}
+)
+
+
+def _content(doc) -> str:
+	"""A stable rendering of a document's content, bookkeeping removed.
+
+	Used to answer one question: would saving this change anything? Frappe's `save()` runs
+	the full cycle regardless -- it writes `modified` and fires `on_update` whether or not a
+	value moved -- and those doc_events are what queue outbound work. So an Item written
+	from a webhook that changed nothing still pushed itself back to Shopify, which sent the
+	webhook again.
+	"""
+
+	def strip(values: dict):
+		return {
+			key: ([strip(row) for row in value] if isinstance(value, list) else cstr(value))
+			for key, value in values.items()
+			if key not in VOLATILE_KEYS
+		}
+
+	return json.dumps(strip(doc.as_dict()), sort_keys=True, default=str)
+
+
+def _save_if_changed(item, before: str | None) -> bool:
+	"""Save the Item only when something actually moved. Returns whether it saved.
+
+	`before` is the content snapshot taken when the document was loaded, or None for one
+	being created. Besides sparing the doc_events, this is what stopped the inbound writer
+	colliding with the outbound one: two jobs saving the same unchanged Item a few hundred
+	milliseconds apart produced forty "Document has been modified after you have opened it"
+	errors in eight minutes, every one of them about a write that had nothing to write.
+	"""
+	if before is not None and _content(item) == before:
+		return False
+	mark(item)
+	item.save(ignore_permissions=True)
+	return True
+
+
+def product_digest(product: dict) -> str:
+	"""A hash of exactly the Shopify fields this app maps onto ERPNext.
+
+	Deliberately not the whole payload, and deliberately not `updated_at`. Shopify stamps
+	`updated_at` and fires `products/update` for things that touch nothing on this side --
+	a metafield, a tag, an image reorder, the publication state, our own inventory or price
+	mutation. Hashing only the mapped fields is what makes an echo of our own write
+	recognisable as one.
+
+	Prices are excluded for the same reason: ERPNext owns them outbound and nothing here
+	reads them back, so our own price push must not read as a change.
+	"""
+
+	def weight(variant: dict, part: str) -> str:
+		measurement = ((variant.get("inventoryItem") or {}).get("measurement") or {}).get("weight") or {}
+		return cstr(measurement.get(part))
+
+	# Both shapes, because the cost of getting this wrong is silent. `product_by_id` returns
+	# variants as a connection and the webhook handler flattens it to a list before mapping;
+	# a caller that hashed the unflattened shape would produce a digest that never matches
+	# the stored one, and echo suppression would simply stop working without a word.
+	variants = product.get("variants") or []
+	if isinstance(variants, dict):
+		variants = [edge["node"] for edge in (variants.get("edges") or []) if edge.get("node")]
+
+	material = {
+		"title": cstr(product.get("title")),
+		"description": cstr(product.get("description")),
+		"status": cstr(product.get("status")),
+		"vendor": cstr(product.get("vendor")),
+		"options": [
+			{"name": cstr(o.get("name")), "values": sorted(cstr(v) for v in (o.get("values") or []))}
+			for o in real_options(product)
+		],
+		"variants": sorted(
+			(
+				{
+					"id": cstr(v.get("id")),
+					# Mapped onto the link rather than the Item, but mapped all the same:
+					# leaving it out would let a changed inventory item slip past as "no
+					# mapped field differs" and strand the link pointing at the old one.
+					"inventory_item": cstr((v.get("inventoryItem") or {}).get("id")),
+					"sku": cstr(v.get("sku")),
+					"title": cstr(v.get("title")),
+					"weight": weight(v, "value"),
+					"weight_unit": weight(v, "unit"),
+					"options": [
+						{"name": cstr(o.get("name")), "value": cstr(o.get("value"))}
+						for o in (v.get("selectedOptions") or [])
+					],
+				}
+				for v in variants
+			),
+			key=lambda variant: variant["id"],
+		),
+	}
+	return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+
+
+def stored_digest(store: str, product_gid: str) -> str | None:
+	"""The digest recorded the last time this product changed anything on this side."""
+	if not product_gid:
+		return None
+	return frappe.db.get_value(
+		"Shopify Item Link", {"store": store, "product_gid": product_gid}, "inbound_digest"
+	)
+
+
+def record_digest(store: str, product_gid: str, digest: str) -> None:
+	"""Stamp the digest on every link for this product.
+
+	Every link, because a product with twelve variants has twelve of them and the check
+	reads whichever one it finds first. Written with `update_modified=False`: this is the
+	app's own bookkeeping and must not make the link look edited.
+	"""
+	if not (product_gid and digest):
+		return
+	frappe.db.sql(
+		"""UPDATE `tabShopify Item Link` SET inbound_digest = %s
+		   WHERE store = %s AND product_gid = %s""",
+		(digest, store, product_gid),
+	)
+
 
 def write_product_mapping(store: str, product: dict) -> dict:
 	"""Create or update the ERPNext Items and Shopify Item Links for one product.
@@ -53,8 +197,15 @@ def write_product_mapping(store: str, product: dict) -> dict:
 			frappe.throw(_("Shopify product {0} has no variants to map.").format(product.get("id")))
 
 		if not options:
-			return _write_simple_product(store, product, variants[0])
-		return _write_variant_product(store, product, options, variants)
+			result = _write_simple_product(store, product, variants[0])
+		else:
+			result = _write_variant_product(store, product, options, variants)
+
+		# After the links exist, because that is what the digest is stamped on. Recorded on
+		# every path, not just the webhook: a bulk import or a reconcile has seen the same
+		# product, so the next webhook carrying it unchanged has nothing to do either.
+		record_digest(store, cstr(product.get("id")), product_digest(product))
+		return result
 
 
 def real_options(product: dict) -> list[dict]:
@@ -141,6 +292,7 @@ def _apply_default_hsn(item, store: str) -> None:
 def _upsert_item(item_code: str, product: dict, variant: dict, item_group: str, store: str):
 	existing = frappe.db.exists("Item", item_code)
 	item = frappe.get_doc("Item", item_code) if existing else frappe.new_doc("Item")
+	before = _content(item) if existing else None
 
 	if not existing:
 		item.item_code = item_code
@@ -154,14 +306,14 @@ def _upsert_item(item_code: str, product: dict, variant: dict, item_group: str, 
 	_apply_weight(item, variant)
 	_apply_supplier(item, product, store)
 
-	mark(item)
-	item.save(ignore_permissions=True)
+	_save_if_changed(item, before)
 	return item
 
 
 def _upsert_template(template_code: str, product: dict, attributes: list[str], item_group: str, store: str):
 	existing = frappe.db.exists("Item", template_code)
 	item = frappe.get_doc("Item", template_code) if existing else frappe.new_doc("Item")
+	before = _content(item) if existing else None
 
 	if not existing:
 		item.item_code = template_code
@@ -180,14 +332,14 @@ def _upsert_template(template_code: str, product: dict, attributes: list[str], i
 		if attribute not in present:
 			item.append("attributes", {"attribute": attribute})
 
-	mark(item)
-	item.save(ignore_permissions=True)
+	_save_if_changed(item, before)
 	return item
 
 
 def _upsert_variant_item(item_code: str, template, product: dict, variant: dict, store: str):
 	existing = frappe.db.exists("Item", item_code)
 	item = frappe.get_doc("Item", item_code) if existing else frappe.new_doc("Item")
+	before = _content(item) if existing else None
 
 	if not existing:
 		item.item_code = item_code
@@ -203,8 +355,7 @@ def _upsert_variant_item(item_code: str, template, product: dict, variant: dict,
 
 	warning = _apply_variant_attributes(item, variant, existing)
 
-	mark(item)
-	item.save(ignore_permissions=True)
+	_save_if_changed(item, before)
 	return item, warning
 
 
