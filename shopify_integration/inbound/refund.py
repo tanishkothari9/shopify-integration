@@ -1028,7 +1028,21 @@ def refunded_amount(refund: dict, side: str) -> Decimal:
 
 
 def _reverse_payment(store_doc, credit_note: str, refund: dict, side: str) -> str | None:
-	"""A reversing Payment Entry, when money genuinely went back."""
+	"""A reversing Payment Entry, when money genuinely went back.
+
+	Booked **on account** -- a Pay to the customer with no reference row -- because ERPNext
+	will not allocate a payment against a credit note. Its outstanding is negative, and both
+	signs are refused: a negative allocation leaves debit and credit unequal, and a positive
+	one trips "Allocated Amount cannot be greater than outstanding amount". Receive is
+	refused outright against a negative outstanding. Every combination was tried against a
+	real site; only this one submits.
+
+	The books are right either way. The credit note credits Debtors and this debits Debtors,
+	so the customer's balance nets to zero and the cash leaves. What is missing is only the
+	*link* between the two documents, which Payment Reconciliation exists to make and which
+	affects the ageing view rather than any balance. The credit note is named in the remarks
+	so whoever reconciles knows what this pays.
+	"""
 	if not store_doc.cash_bank_account:
 		return None
 
@@ -1039,30 +1053,23 @@ def _reverse_payment(store_doc, credit_note: str, refund: dict, side: str) -> st
 	from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
 	with inbound_write():
+		# Built from the credit note so the party, currency and receivable account are
+		# ERPNext's own choices, then unlinked.
 		entry = get_payment_entry("Sales Invoice", credit_note)
+		entry.set("references", [])
 		entry.reference_no = cstr((refund.get("order") or {}).get("name")) or credit_note
 		entry.reference_date = frappe.db.get_value("Sales Invoice", credit_note, "posting_date")
 		entry.paid_from = store_doc.cash_bank_account
 
-		# get_payment_entry sizes itself from the credit note's own outstanding, which is the
-		# whole refund. Only part of it may have left the bank: a 5,000 refund settled as 2,000
-		# to the card and 3,000 in store credit moves 2,000. Paying out the full amount
-		# overstates the bank by the difference, and it will not reconcile against a statement.
-		#
-		# Scaled down from what get_payment_entry produced rather than rebuilt: a credit note's
-		# outstanding is negative and its allocations follow that sign, and reconstructing those
-		# conventions by hand trips ERPNext's own validation from two directions at once.
-		# Scaling keeps them and only changes the magnitude.
+		# What actually left the bank, which is not always the whole credit note: a 5,000
+		# refund settled as 2,000 to the card and 3,000 in store credit moves 2,000. Paying
+		# the full amount would overstate the bank and never reconcile to a statement.
 		wanted = to_float(quantize(amount))
-		default = entry.paid_amount or 0
-		if default and wanted < default:
-			ratio = wanted / default
-			for reference in entry.references:
-				reference.allocated_amount = flt(
-					(reference.allocated_amount or 0) * ratio, reference.precision("allocated_amount")
-				)
-			entry.paid_amount = wanted
-			entry.received_amount = wanted
+		entry.paid_amount = wanted
+		entry.received_amount = wanted
+		entry.remarks = _("Shopify refund {0} against credit note {1}").format(
+			cstr(refund.get("id")), credit_note
+		)
 
 		mark(entry)
 		entry.insert(ignore_permissions=True)
@@ -1071,13 +1078,24 @@ def _reverse_payment(store_doc, credit_note: str, refund: dict, side: str) -> st
 	return entry.name
 
 
-def _itemised_refund_total(refund: dict, side: str) -> Decimal:
-	"""The refund's own line items and shipping, with their tax. What a credit note models."""
+def _itemised_refund_total(refund: dict, side: str, inclusive: bool) -> Decimal:
+	"""The refund's own line items and shipping. What a credit note models.
+
+	On a tax-inclusive order `subtotalSet` is already the gross figure and `totalTaxSet` is
+	the tax *inside* it, so adding the two double-counts the tax. Refunding one 1,200 saree
+	on an 18%-inclusive order reports subtotal 1,200 and tax 183.05; the credit note is
+	rightly 1,200, and demanding 1,383.05 refused the whole refund. Exclusive orders are the
+	other way round -- the subtotal is net and the tax goes on top.
+	"""
 	total = ZERO
 	for node in (refund.get("refundLineItems") or {}).get("nodes") or []:
-		total += money_field(node, "subtotalSet", side) + money_field(node, "totalTaxSet", side)
+		total += money_field(node, "subtotalSet", side)
+		if not inclusive:
+			total += money_field(node, "totalTaxSet", side)
 	for node in (refund.get("refundShippingLines") or {}).get("nodes") or []:
-		total += money_field(node, "subtotalAmountSet", side) + money_field(node, "taxAmountSet", side)
+		total += money_field(node, "subtotalAmountSet", side)
+		if not inclusive:
+			total += money_field(node, "taxAmountSet", side)
 	return total
 
 
@@ -1116,7 +1134,7 @@ def _assert_credit_matches(credit_note, refund: dict, side: str) -> None:
 	# is built from the refunded lines at the invoice's own rates, so that is what it has
 	# to be checked against -- comparing it to the cash refused the whole refund and posted
 	# nothing at all, which is worse than either number.
-	expected = _itemised_refund_total(refund, side)
+	expected = _itemised_refund_total(refund, side, _is_inclusive(list(credit_note.get("taxes") or [])))
 	if expected == ZERO:
 		return
 

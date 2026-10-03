@@ -1123,3 +1123,144 @@ class TestARefundOfPostageAlone(FrappeTestCase):
 		source = inspect.getsource(module.create_credit_note)
 		self.assertIn("Shipping Item", source)
 		self.assertIn("goodwill", source)
+
+
+class TestATestOrderOnADevelopmentStore(FrappeTestCase):
+	"""Skipping test orders is right for a real shop and wrong for a development store,
+	where the Bogus Gateway is the only way to pay at all -- so without a way to opt in,
+	the integration could not be exercised end to end anywhere except a live shop with
+	live money."""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		from shopify_integration.tests.test_integration import SECRET_A, make_store
+
+		cls.store = make_store("Test Store A", "test-a.myshopify.com", SECRET_A)
+
+	def _fetch(self, order):
+		from shopify_integration.inbound import order as module
+
+		with patch.object(module.ShopifyClient, "for_store", return_value=_OrderClient(order)):
+			return module.fetch_order(self.store, {"admin_graphql_api_id": order["id"]})
+
+	def setUp(self):
+		self.addCleanup(frappe.db.set_value, "Shopify Store", self.store, "import_test_orders", 0)
+
+	def test_off_by_default(self):
+		frappe.db.set_value("Shopify Store", self.store, "import_test_orders", 0)
+		self.assertIsNone(self._fetch({"id": "gid://shopify/Order/t1", "name": "#t1", "test": True}))
+
+	def test_a_store_that_opts_in_gets_them(self):
+		frappe.db.set_value("Shopify Store", self.store, "import_test_orders", 1)
+		fetched = self._fetch({"id": "gid://shopify/Order/t2", "name": "#t2", "test": True})
+		self.assertIsNotNone(fetched)
+		self.assertEqual(fetched["name"], "#t2")
+
+	def test_a_real_order_is_unaffected_either_way(self):
+		for opted_in in (0, 1):
+			frappe.db.set_value("Shopify Store", self.store, "import_test_orders", opted_in)
+			self.assertIsNotNone(
+				self._fetch({"id": "gid://shopify/Order/r1", "name": "#r1", "test": False}),
+				f"import_test_orders={opted_in}",
+			)
+
+
+class TestWhatACreditNoteIsCheckedAgainst(FrappeTestCase):
+	"""Found against a live store: refunding one 1,200 saree from a tax-inclusive order was
+	refused outright. Shopify reports that line as subtotal 1,200 with tax 183.05 -- the tax
+	being *inside* the 1,200, not on top -- so adding the two demanded 1,383.05 from a credit
+	note that is rightly 1,200, and the whole refund was thrown away.
+	"""
+
+	def _inclusive_line(self):
+		"""The exact figures Shopify returned for order #1190 on the live store."""
+		return {
+			"subtotalSet": {"shopMoney": {"amount": "1200.00"}, "presentmentMoney": {"amount": "1200.00"}},
+			"totalTaxSet": {"shopMoney": {"amount": "183.05"}, "presentmentMoney": {"amount": "183.05"}},
+		}
+
+	def _refund(self, line=None, shipping=None):
+		return {
+			"id": "gid://shopify/Refund/1",
+			"refundLineItems": {"nodes": [line or self._inclusive_line()]},
+			"refundShippingLines": {"nodes": shipping or []},
+		}
+
+	def test_an_inclusive_refund_expects_the_gross_subtotal(self):
+		from shopify_integration.inbound.refund import _itemised_refund_total
+
+		self.assertEqual(
+			float(_itemised_refund_total(self._refund(), "shopMoney", inclusive=True)),
+			1200.00,
+			"the tax is already inside the subtotal",
+		)
+
+	def test_an_exclusive_refund_adds_the_tax_on_top(self):
+		from shopify_integration.inbound.refund import _itemised_refund_total
+
+		self.assertEqual(float(_itemised_refund_total(self._refund(), "shopMoney", inclusive=False)), 1383.05)
+
+	def test_shipping_follows_the_same_rule(self):
+		from shopify_integration.inbound.refund import _itemised_refund_total
+
+		shipping = [
+			{
+				"subtotalAmountSet": {
+					"shopMoney": {"amount": "100.00"},
+					"presentmentMoney": {"amount": "100.00"},
+				},
+				"taxAmountSet": {"shopMoney": {"amount": "18.00"}, "presentmentMoney": {"amount": "18.00"}},
+			}
+		]
+		refund = self._refund(shipping=shipping)
+		self.assertEqual(float(_itemised_refund_total(refund, "shopMoney", inclusive=True)), 1300.00)
+		self.assertEqual(float(_itemised_refund_total(refund, "shopMoney", inclusive=False)), 1501.05)
+
+	def test_the_check_reads_inclusivity_off_the_credit_note(self):
+		"""Not from the order payload -- the credit note's own tax rows are what the total
+		it is being compared against was built from."""
+		import inspect
+
+		from shopify_integration.inbound import refund as module
+
+		source = inspect.getsource(module._assert_credit_matches)
+		self.assertIn('_is_inclusive(list(credit_note.get("taxes") or []))', source)
+
+
+class TestTheReversingPaymentIsBookedOnAccount(FrappeTestCase):
+	"""ERPNext will not allocate a payment against a credit note: its outstanding is
+	negative, and both signs are refused -- a negative allocation leaves debit and credit
+	unequal, a positive one trips "Allocated Amount cannot be greater than outstanding
+	amount", and Receive is refused against a negative outstanding. Every shape was tried
+	against a real site; only an on-account Pay submits.
+
+	The books are right regardless: the credit note credits Debtors and this debits Debtors,
+	so the customer nets to zero and the cash leaves. Only the document link is missing,
+	which is Payment Reconciliation's job.
+	"""
+
+	def test_it_clears_the_reference_rows(self):
+		import inspect
+
+		from shopify_integration.inbound import refund as module
+
+		source = inspect.getsource(module._reverse_payment)
+		self.assertIn('entry.set("references", [])', source)
+
+	def test_it_pays_what_actually_left_the_bank(self):
+		"""Not the credit note's total: part of a refund can be settled in store credit."""
+		import inspect
+
+		from shopify_integration.inbound import refund as module
+
+		source = inspect.getsource(module._reverse_payment)
+		self.assertIn("refunded_amount(refund, side)", source)
+		self.assertIn("entry.paid_amount = wanted", source)
+
+	def test_it_names_the_credit_note_for_whoever_reconciles(self):
+		import inspect
+
+		from shopify_integration.inbound import refund as module
+
+		self.assertIn("entry.remarks", inspect.getsource(module._reverse_payment))

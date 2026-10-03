@@ -219,7 +219,7 @@ def fetch_order(store: str, payload: dict) -> dict | None:
 	if not order:
 		return None
 
-	if order.get("test"):
+	if order.get("test") and not frappe.db.get_value("Shopify Store", store, "import_test_orders"):
 		# Placed through the Bogus Gateway or a provider in test mode -- which is how
 		# everybody verifies this very integration, and how a merchant tries their checkout
 		# out before launch. Booked as real, one of these submits a Sales Order that reserves
@@ -231,6 +231,10 @@ def fetch_order(store: str, payload: dict) -> dict | None:
 		# Returned as absent rather than thrown: every caller already treats None as "nothing
 		# to do here" and marks the event Success, which is the right outcome -- there is no
 		# fault to retry.
+		#
+		# A development store can only produce test orders, so there is a store setting to
+		# take them: without it the integration cannot be exercised end to end anywhere
+		# except a live shop with live money, which is not a reasonable way to test it.
 		frappe.logger("shopify_integration").info(
 			f"Ignoring Shopify order {order.get('name') or gid}: it is a test order."
 		)

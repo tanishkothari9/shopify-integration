@@ -39,6 +39,7 @@
   "credit_note_series",
   "section_inbound",
   "sync_orders",
+  "import_test_orders",
   "sync_invoices",
   "column_break_inbound",
   "sync_delivery_notes",
@@ -454,6 +455,14 @@
    "label": "Webhook Callback URL",
    "read_only": 1,
    "description": "The endpoint Shopify posts to. Registered automatically; shown for support."
+  },
+  {
+   "fieldname": "import_test_orders",
+   "fieldtype": "Check",
+   "default": "0",
+   "label": "Import Test Orders",
+   "depends_on": "sync_orders",
+   "description": "Import orders Shopify marks as tests -- those paid through the Bogus Gateway or a provider in test mode. Off for a real shop, where a test order booked as a sale reserves stock and pays into the real bank account. On for a development store, which is the only kind of order one can place there."
   }
  ],
  "index_web_pages_for_search": 1,
