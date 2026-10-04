@@ -5,6 +5,35 @@ frappe.ui.form.on("Shopify Store", {
 		frm.trigger("show_install_state");
 
 		if (!frm.is_new()) {
+			frm.add_custom_button(
+				__("Create Metafield Definitions"),
+				() => {
+					frappe.call({
+						method:
+							"shopify_integration.shopify_integration.doctype.shopify_store.shopify_store.create_metafield_definitions",
+						args: { store: frm.doc.name },
+						freeze: true,
+						freeze_message: __("Defining this shop's product metafields on Shopify..."),
+						callback: ({ message }) => {
+							if (!message) return;
+							const lines = [];
+							if (message.created.length)
+								lines.push(__("Created: {0}", [message.created.join(", ")]));
+							if (message.already_there.length)
+								lines.push(__("Already there: {0}", [message.already_there.join(", ")]));
+							if (message.failed.length)
+								lines.push(__("Could not create: {0}", [message.failed.join("<br>")]));
+							frappe.msgprint({
+								title: __("Product Metafields"),
+								message: lines.join("<br>") || __("Nothing to do."),
+								indicator: message.failed.length ? "orange" : "green",
+							});
+						},
+					});
+				},
+				__("Shopify")
+			);
+
 			// Dev Dashboard apps issue tokens only via OAuth, so this replaces pasting one.
 			if (!frm.doc.installed_on) {
 				frm.add_custom_button(__("Install with Shopify"), () => {

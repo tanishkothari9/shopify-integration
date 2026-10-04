@@ -1,0 +1,10 @@
+# Define one product metafield on the store.
+#
+# Idempotent at the call site, not here: Shopify answers a definition that already exists
+# with a TAKEN error, which the caller reads as "already done" rather than a failure.
+mutation MetafieldDefinitionCreate($definition: MetafieldDefinitionInput!) {
+  metafieldDefinitionCreate(definition: $definition) {
+    createdDefinition { id namespace key name }
+    userErrors { field message code }
+  }
+}

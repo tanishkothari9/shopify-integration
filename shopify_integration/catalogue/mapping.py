@@ -293,6 +293,29 @@ def _apply_default_hsn(item, store: str) -> None:
 		item.gst_hsn_code = default
 
 
+def erpnext_owns_content(store: str, item_code: str) -> bool:
+	"""Whether this Item's name and description are ERPNext's to keep.
+
+	They are, for anything this app published. Shopify holds a *copy* of that content for
+	the storefront; the merchant may edit it there, and this app must not carry the edit
+	back. `item_name` is printed on bills, POS receipts and barcodes -- on 3 October a title
+	edited in the Shopify admin renamed STOITEM202605492, 498 and 499 to "Aariz Luxe Kurta"
+	in ERPNext, on three items the shop sells under their own names.
+
+	Two signals, because the first is not always there yet. The link records the origin, but
+	the echo of our own `products/create` can arrive before the link is written; the
+	`publish_to_shopify` checkbox that caused the publish is already set by then, and a
+	product imported *from* Shopify never has it.
+	"""
+	if frappe.db.exists(
+		"Shopify Item Link", {"store": store, "item_code": item_code, "origin": "ERPNext"}
+	):
+		return True
+
+	subject = frappe.db.get_value("Item", item_code, "variant_of") or item_code
+	return bool(frappe.db.get_value("Item", subject, "publish_to_shopify"))
+
+
 def _upsert_item(item_code: str, product: dict, variant: dict, item_group: str, store: str):
 	existing = frappe.db.exists("Item", item_code)
 	item = frappe.get_doc("Item", item_code) if existing else frappe.new_doc("Item")
@@ -304,8 +327,9 @@ def _upsert_item(item_code: str, product: dict, variant: dict, item_group: str, 
 		item.stock_uom = default_stock_uom()
 		_apply_default_hsn(item, store)
 
-	item.item_name = _item_name(product, variant)
-	item.description = product.get("description") or item.item_name
+	if not erpnext_owns_content(store, item_code):
+		item.item_name = _item_name(product, variant)
+		item.description = product.get("description") or item.item_name
 	item.disabled = 1 if product.get("status") == "ARCHIVED" else 0
 	_apply_weight(item, variant)
 	_apply_supplier(item, product, store)
@@ -362,8 +386,9 @@ def _upsert_template(template_code: str, product: dict, attributes: list[str], i
 		item.has_variants = 1
 		_apply_default_hsn(item, store)
 
-	item.item_name = product.get("title") or template_code
-	item.description = product.get("description") or item.item_name
+	if not erpnext_owns_content(store, template_code):
+		item.item_name = product.get("title") or template_code
+		item.description = product.get("description") or item.item_name
 	item.disabled = 1 if product.get("status") == "ARCHIVED" else 0
 	_apply_supplier(item, product, store)
 
@@ -388,8 +413,9 @@ def _upsert_variant_item(item_code: str, template, product: dict, variant: dict,
 		item.stock_uom = template.stock_uom
 		_apply_default_hsn(item, store)
 
-	item.item_name = _item_name(product, variant)
-	item.description = product.get("description") or item.item_name
+	if not erpnext_owns_content(store, item_code):
+		item.item_name = _item_name(product, variant)
+		item.description = product.get("description") or item.item_name
 	item.disabled = 1 if product.get("status") == "ARCHIVED" else 0
 	_apply_weight(item, variant)
 
@@ -908,6 +934,7 @@ def upsert_link(
 	variant: dict,
 	is_variant: bool,
 	template_item: str | None = None,
+	origin: str | None = None,
 ) -> str:
 	"""Create or refresh the Shopify Item Link for one variant.
 
@@ -951,6 +978,13 @@ def upsert_link(
 		link.sku = cstr(variant.get("sku")).strip() or None
 		link.is_variant = 1 if is_variant else 0
 		link.template_item = template_item
+		if origin:
+			# Set whenever the caller states one, which only the outbound create path does.
+			# Not "on insert only": the echo of our own `products/create` routinely writes
+			# the link first, defaulting it to Shopify, and the publish that follows has to
+			# be able to correct that. The inbound writer never passes an origin, so it can
+			# never downgrade one.
+			link.origin = origin
 
 		mark(link)
 		link.save(ignore_permissions=True)

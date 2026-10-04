@@ -73,17 +73,19 @@ class ProductPushTestCase(FrappeTestCase):
 		return updates[0]["variables"]["product"]
 
 	def _set_titles(self, on: int):
-		frappe.db.set_value("Shopify Store", self.store, "sync_item_titles", on)
+		frappe.db.set_value("Shopify Store", self.store, "sync_website_content", on)
 		frappe.db.commit()
 		frappe.clear_document_cache("Shopify Store", self.store)
 
 
 class TestStorefrontCopyIsLeftAlone(ProductPushTestCase):
-	def tearDown(self):
-		self._set_titles(0)
+	"""ERPNext is the master now, and a store can still hand the copy back to Shopify."""
 
-	def test_an_ordinary_update_does_not_touch_title_or_description(self):
-		"""The regression. Saving an Item pushes what ERPNext owns and nothing else."""
+	def tearDown(self):
+		self._set_titles(1)
+
+	def test_a_store_that_switches_it_off_keeps_its_shopify_copy(self):
+		"""Not the default any more, but still a choice a merchant can make."""
 		self._set_titles(0)
 		payload = self._push()
 
@@ -103,18 +105,18 @@ class TestStorefrontCopyIsLeftAlone(ProductPushTestCase):
 			frappe.db.set_value("Item", self.item_code, "disabled", 0)
 			frappe.db.commit()
 
-	def test_a_merchant_can_opt_in_to_erpnext_owning_the_copy(self):
-		"""Some catalogues really are mastered in ERPNext. That is a decision, not a default."""
+	def test_erpnext_owns_the_copy(self):
+		"""With nothing written in the Website section, the Item's own name and text go."""
 		self._set_titles(1)
 		payload = self._push()
 
 		self.assertEqual(payload["title"], "Plain ERPNext Name")
 		self.assertEqual(payload["descriptionHtml"], "Plain ERPNext description")
 
-	def test_the_opt_in_is_off_by_default(self):
-		"""A merchant who installs the app and configures nothing keeps their copy."""
-		field = frappe.get_meta("Shopify Store").get_field("sync_item_titles")
-		self.assertIn(field.default, (None, "", "0"))
+	def test_it_is_on_by_default(self):
+		"""ERPNext is the master for website content, as it is for price, stock and images."""
+		field = frappe.get_meta("Shopify Store").get_field("sync_website_content")
+		self.assertEqual(field.default, "1")
 
 
 class TestItemImageReachesShopify(FrappeTestCase):

@@ -1,0 +1,43 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2026-10-04 09:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "collection_gid",
+  "collection_title"
+ ],
+ "fields": [
+  {
+   "fieldname": "collection_gid",
+   "fieldtype": "Data",
+   "label": "Collection GID",
+   "reqd": 1,
+   "in_list_view": 1,
+   "columns": 5,
+   "description": "gid://shopify/Collection/123456789"
+  },
+  {
+   "fieldname": "collection_title",
+   "fieldtype": "Data",
+   "label": "Title",
+   "in_list_view": 1,
+   "columns": 5,
+   "description": "For people reading the form. Shopify is told the GID, never this."
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-10-04 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Shopify Integration",
+ "name": "Shopify Item Collection",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

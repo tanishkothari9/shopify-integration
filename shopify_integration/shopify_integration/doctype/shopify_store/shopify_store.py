@@ -352,3 +352,18 @@ def unregister_webhooks(store: str) -> dict:
 	result = webhooks.unregister(client)
 	frappe.logger("shopify_integration").info(f"Removed webhooks for {store}: {result}")
 	return result
+
+
+@frappe.whitelist()
+def create_metafield_definitions(store: str) -> dict:
+	"""Define this shop's own product metafields on Shopify. Safe to run again.
+
+	Called from the form. Shopify answers a definition that already exists with TAKEN, so
+	running it twice reports them as already there rather than failing.
+	"""
+	frappe.has_permission("Shopify Store", "write", doc=store, throw=True)
+
+	from shopify_integration.api.client import ShopifyClient
+	from shopify_integration.outbound.content import ensure_metafield_definitions
+
+	return ensure_metafield_definitions(ShopifyClient.for_store(store))

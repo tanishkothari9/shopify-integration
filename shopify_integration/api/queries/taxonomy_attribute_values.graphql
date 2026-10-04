@@ -1,0 +1,16 @@
+# The values one taxonomy choice-list attribute allows.
+#
+# Paginated, because Color alone has well over a hundred. Its own query so the cost stays
+# flat however many attributes a category has.
+query TaxonomyAttributeValues($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on TaxonomyChoiceListAttribute {
+      id
+      name
+      values(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        edges { cursor node { id name } }
+      }
+    }
+  }
+}

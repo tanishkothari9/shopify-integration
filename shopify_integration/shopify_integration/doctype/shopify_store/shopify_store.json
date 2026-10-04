@@ -50,7 +50,7 @@
   "verify_stock_before_write",
   "sync_items",
   "sync_item_images",
-  "sync_item_titles",
+  "sync_website_content",
   "create_suppliers_from_vendor",
   "column_break_outbound",
   "sync_prices",
@@ -315,11 +315,11 @@
    "description": "Keep the Shopify product's featured image in step with the Item's. Only images this app put there are ever replaced -- photography the merchant added in Shopify stays, and stays in the order they arranged it. Turn this off if the storefront images are managed entirely in Shopify."
   },
   {
-   "fieldname": "sync_item_titles",
+   "fieldname": "sync_website_content",
    "fieldtype": "Check",
-   "label": "Let ERPNext Overwrite Shopify Titles and Descriptions",
-   "default": "0",
-   "description": "Off by default, and think hard before turning it on. Shopify holds your storefront copy -- the title a customer reads, the description someone wrote for the product page. With this on, any edit to the Item in ERPNext replaces both with ERPNext's plain values, including an edit to something unrelated like a weight."
+   "label": "Sync Website Content From ERPNext",
+   "default": "1",
+   "description": "On by default: ERPNext is the master for website content, as it already is for price, stock, sizes and images. The Website (Shopify) section on the Item holds the title, description, SEO, handle, tags, category, metafields, collections and image alt text, and this app sends them to Shopify. Where a field is empty the Item's own name and description are used. Turning this off leaves the storefront copy to be written in the Shopify admin instead."
   },
   {
    "fieldname": "create_suppliers_from_vendor",

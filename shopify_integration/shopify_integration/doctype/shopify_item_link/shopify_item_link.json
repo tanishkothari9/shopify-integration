@@ -12,6 +12,7 @@
   "column_break_1",
   "is_variant",
   "is_template",
+  "origin",
   "template_item",
   "section_shopify",
   "product_gid",
@@ -24,6 +25,7 @@
   "price_synced_on",
   "online_store_publish_done",
   "app_media",
+  "app_collections",
   "initial_state_pushed",
   "inbound_digest"
  ],
@@ -160,6 +162,24 @@
    "default": "0",
    "search_index": 1,
    "description": "This row is the variant template's own record of which Shopify product it owns, not a sellable variant: it carries a product_gid and no variant_gid. Before it existed a template's product could only be inferred backwards from its children's rows, so an echo that corrupted one child's template_item detached the whole range -- and disabling a single size then created a second Shopify product for it."
+  },
+  {
+   "fieldname": "origin",
+   "fieldtype": "Select",
+   "label": "Origin",
+   "options": "Shopify\nERPNext",
+   "default": "Shopify",
+   "read_only": 1,
+   "search_index": 1,
+   "description": "Which side this product came from. 'ERPNext' means this app created the Shopify product from an Item, so ERPNext owns its name, description and website content and an inbound webhook must never write them back. 'Shopify' means the product was imported, and Shopify's copy is the real one. Without this the two were indistinguishable, and editing a title in the Shopify admin renamed the ERPNext Item that bills, POS receipts and barcodes are printed from."
+  },
+  {
+   "fieldname": "app_collections",
+   "fieldtype": "Code",
+   "options": "JSON",
+   "label": "App Collections",
+   "read_only": 1,
+   "description": "The manual collections this app put the product in, as a list of GIDs. It is the only thing separating those from collections the merchant added by hand in the Shopify admin, which are never removed."
   }
  ],
  "index_web_pages_for_search": 1,

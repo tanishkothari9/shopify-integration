@@ -1,0 +1,11 @@
+# Write a product's metafields.
+#
+# `metafieldsSet` rather than the `metafields` field on productUpdate: it writes them
+# without touching the product, so a copy change and a metafield change are separate
+# mutations and a failure in one does not roll back the other.
+mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+  metafieldsSet(metafields: $metafields) {
+    metafields { id namespace key type }
+    userErrors { field message code }
+  }
+}

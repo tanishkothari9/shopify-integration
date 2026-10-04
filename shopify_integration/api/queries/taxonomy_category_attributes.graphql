@@ -1,0 +1,26 @@
+# Which attributes a Shopify taxonomy category has.
+#
+# Names and ids only. The allowed *values* of a choice list are a connection inside this
+# one, and Shopify charges the product of the two: 25 attributes each with 50 values is
+# over 1,300 points against a ceiling of 1,000, so the whole query would be refused before
+# it ran. The values are fetched per attribute instead, and only for the attributes the
+# merchant has actually filled in.
+#
+# `TaxonomyAttribute` is the bare Node in the union and carries nothing but an id -- the
+# named ones are the choice lists and the measurements, which are the two kinds that can
+# be validated anyway.
+query TaxonomyCategoryAttributes($id: ID!) {
+  node(id: $id) {
+    ... on TaxonomyCategory {
+      id
+      fullName
+      isLeaf
+      attributes(first: 50) {
+        nodes {
+          ... on TaxonomyChoiceListAttribute { id name }
+          ... on TaxonomyMeasurementAttribute { id name }
+        }
+      }
+    }
+  }
+}

@@ -264,18 +264,36 @@ def _variant_media(client: ShopifyClient, product_gid: str) -> dict[str, list[st
 	return attached
 
 
-def _create(client: ShopifyClient, product_gid: str, sources: list[tuple[str, str]], subject: str) -> dict:
-	"""Upload images and return file_url -> media id for the ones Shopify accepted."""
+def _create(
+	client: ShopifyClient,
+	product_gid: str,
+	sources: list[tuple[str, str]],
+	subject: str,
+	alts: dict[str, str] | None = None,
+) -> dict:
+	"""Upload images and return file_url -> media id for the ones Shopify accepted.
+
+	The alt text goes on at upload. It cannot go on afterwards: Shopify processes media
+	asynchronously and refuses `productUpdateMedia` with "Non-ready media cannot be
+	updated" until it finishes, which is never true in the same pass that created it. Sent
+	here it is simply part of the upload, and the merchant's words are on the image from
+	the moment the storefront can show it.
+	"""
 	if not sources:
 		return {}
 
+	alts = alts or {}
 	result = client.execute(
 		load_query("product_create_media"),
 		{
 			"productId": product_gid,
 			"media": [
-				{"originalSource": url, "mediaContentType": "IMAGE", "alt": subject}
-				for _file_url, url in sources
+				{
+					"originalSource": url,
+					"mediaContentType": "IMAGE",
+					"alt": alts.get(file_url) or subject,
+				}
+				for file_url, url in sources
 			],
 		},
 		cost_hint=10 + len(sources),
@@ -382,7 +400,7 @@ def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -
 	# and must not be counted as somebody else's.
 	theirs = [gid for gid in on_product if gid not in recorded.values()]
 	room = max(MAX_MEDIA_PER_PRODUCT - len(theirs), 0)
-	wanted = plan["order"][:room]
+	wanted = _in_merchants_order(subject, store_doc, plan["order"])[:room]
 	if len(plan["order"]) > room:
 		failures.append(
 			f"{subject}: {len(plan['order']) - room} image(s) left off -- the product is at "
@@ -427,7 +445,12 @@ def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -
 		if url:
 			sources.append((file_url, url))
 
-	created = _create(client, link.product_gid, sources, subject)
+	from shopify_integration.outbound.content import desired_image_alts
+
+	wanted_alts = desired_image_alts(frappe.get_cached_doc("Item", subject)) if store_doc.get(
+		"sync_website_content"
+	) else {}
+	created = _create(client, link.product_gid, sources, subject, wanted_alts)
 	stamp = cstr(now_datetime())
 	for file_url, gid in created.items():
 		record[file_url] = {"id": gid, "at": stamp}
@@ -447,6 +470,7 @@ def _sync_media_unlocked(client: ShopifyClient, store_doc, subject: str, link) -
 	usable = {**live, **created}
 	_feature_the_main_image(client, link.product_gid, wanted, usable, on_product, created)
 	attached = _attach_to_variants(client, store_doc.name, link.product_gid, plan, usable)
+	failures += _apply_alt_text(client, store_doc, subject, link, usable, on_product)
 
 	return {
 		"added": len(created),
@@ -730,3 +754,86 @@ def prune_duplicate_media(store: str, item_code: str, apply: bool = False) -> di
 	report["applied"] = True
 	report["deleted"] = len(deleted)
 	return report
+
+
+def _apply_alt_text(
+	client: ShopifyClient, store_doc, subject: str, link, usable: dict, on_product: dict
+) -> list[str]:
+	"""Alt text and storefront order, for media this app owns.
+
+	Done here rather than from the product push because this is the only place that knows
+	the media ids: the product update runs before the images have been uploaded, finds an
+	empty ownership record, and would silently set alt text on nothing. The merchant's own
+	photography is not in `usable` and keeps the alt text they wrote for it.
+	"""
+	from shopify_integration.outbound.content import desired_image_alts, desired_image_order
+
+	if not store_doc.get("sync_website_content") or not usable:
+		return []
+
+	item = frappe.get_cached_doc("Item", subject)
+	failures = []
+
+	# Only READY media. Shopify refuses to update anything still processing -- "Non-ready
+	# media cannot be updated" -- and an image uploaded moments ago never is. The alt text
+	# for those went on at upload; this is for the ones whose text changed afterwards.
+	ready = {
+		file_url: media_id
+		for file_url, media_id in usable.items()
+		if cstr((on_product.get(media_id) or {}).get("status")) == "READY"
+	}
+
+	updates = [
+		{"id": ready[file_url], "alt": alt}
+		for file_url, alt in desired_image_alts(item).items()
+		if file_url in ready and cstr((on_product.get(ready[file_url]) or {}).get("alt")) != alt
+	]
+	if updates:
+		result = client.execute(
+			load_query("product_update_media"),
+			{"productId": link.product_gid, "media": updates},
+			cost_hint=10 + len(updates),
+		)
+		errors = (result.get("productUpdateMedia") or {}).get("mediaUserErrors") or []
+		failures += [f"{subject}: alt text -- {_readable([error])}" for error in errors]
+
+	order = [ready[file_url] for file_url in desired_image_order(item) if file_url in ready]
+	if order:
+		result = client.execute(
+			load_query("product_reorder_media"),
+			{"id": link.product_gid, "moves": [
+				{"id": media_id, "newPosition": str(index)} for index, media_id in enumerate(order)
+			]},
+			cost_hint=10,
+		)
+		errors = (result.get("productReorderMedia") or {}).get("mediaUserErrors") or []
+		failures += [f"{subject}: image order -- {_readable([error])}" for error in errors]
+
+	return failures
+
+
+def _in_merchants_order(subject: str, store_doc, files: list[str]) -> list[str]:
+	"""The images in the order the merchant asked for, where they have asked.
+
+	Applied before uploading, because Shopify lists media in the order it was created and
+	will not reorder anything still processing -- which, on the pass that creates them, is
+	all of them. Ordering them here means the storefront is right the first time instead of
+	waiting for a later sync that nothing would have asked for.
+
+	Files with no position keep their existing place, after the ones that have one: the
+	Image field first and then attachments oldest-first, which is what `media_plan` built.
+	"""
+	from shopify_integration.outbound.content import desired_image_order
+
+	if not store_doc.get("sync_website_content"):
+		return files
+
+	try:
+		positions = desired_image_order(frappe.get_cached_doc("Item", subject))
+	except frappe.DoesNotExistError:
+		return files
+	if not positions:
+		return files
+
+	ranked = {file_url: rank for rank, file_url in enumerate(positions)}
+	return sorted(files, key=lambda f: (ranked.get(f, len(ranked)), files.index(f)))

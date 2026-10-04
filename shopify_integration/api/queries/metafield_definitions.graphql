@@ -1,0 +1,10 @@
+# Which product metafields this store has definitions for, in one namespace.
+#
+# Asked before writing any, because Shopify refuses a key it has no definition for -- and
+# refuses the whole `metafieldsSet` call with it. On 4 October one unwritable key cost a
+# product every metafield, its collection move and its image alt text in the same breath.
+query MetafieldDefinitions($namespace: String!) {
+  metafieldDefinitions(first: 250, ownerType: PRODUCT, namespace: $namespace) {
+    nodes { namespace key }
+  }
+}

@@ -1,0 +1,18 @@
+# What a handful of collections are, by id.
+#
+# `ruleSet` is the question that matters: a collection with one is automatic, and decides
+# its own membership from the rules. Asking Shopify to join a product to one is refused, so
+# they are skipped with a message rather than failing the whole product.
+#
+# `nodes` rather than one query per collection: a product's list is short, and this is one
+# call however many it names.
+query CollectionsById($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Collection {
+      id
+      title
+      handle
+      ruleSet { appliedDisjunctively }
+    }
+  }
+}

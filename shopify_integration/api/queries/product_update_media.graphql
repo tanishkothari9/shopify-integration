@@ -1,0 +1,10 @@
+# Alt text on media the app owns.
+#
+# Only ever called for media recorded in `app_media`: photography the merchant uploaded in
+# the Shopify admin carries their own alt text, and rewriting it would undo their work.
+mutation ProductUpdateMedia($productId: ID!, $media: [UpdateMediaInput!]!) {
+  productUpdateMedia(productId: $productId, media: $media) {
+    media { id alt }
+    mediaUserErrors { field message code }
+  }
+}

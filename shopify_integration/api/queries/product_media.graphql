@@ -20,6 +20,7 @@ query ProductMedia($id: ID!) {
         ... on MediaImage {
           id
           status
+          alt
           mediaErrors { code details message }
         }
       }

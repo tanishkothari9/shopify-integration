@@ -25,6 +25,13 @@ from frappe.utils import cstr
 from shopify_integration.api.client import ShopifyClient, load_query
 from shopify_integration.catalogue.echo import is_echo
 from shopify_integration.exceptions import PartialFailure
+from shopify_integration.outbound.content import (
+	ContentError,
+	desired_metafields,
+	record_app_collections,
+	validate_category_metafields,
+	website_payload,
+)
 from shopify_integration.outbound.media import enqueue_media
 from shopify_integration.shopify_integration.doctype.shopify_item_link.shopify_item_link import (
 	linked_stores,
@@ -207,14 +214,25 @@ def push_products(store: str, rows: list[dict]) -> None:
 			# the plain item name, and wiped the marketing HTML under it.
 			#
 			# Whether the item is sellable is ERPNext's to say, so status still goes.
+			store_doc = frappe.get_cached_doc("Shopify Store", store)
 			payload = {
 				"id": link.product_gid,
 				"status": "ARCHIVED" if _product_is_dead(subject, item) else "ACTIVE",
 			}
 
-			if frappe.db.get_value("Shopify Store", store, "sync_item_titles"):
-				payload["title"] = cstr(item.item_name)[:255]
-				payload["descriptionHtml"] = cstr(item.description or "")
+			# The storefront copy, and the manual collections it belongs to, folded into the
+			# same mutation. ERPNext is the master for all of it; where a field is empty the
+			# Item's own name and description stand in.
+			problems: list[str] = []
+			plan = None
+			if store_doc.get("sync_website_content"):
+				payload.update(website_payload(store_doc, item, creating=False))
+				plan = _collection_plan(client, store_doc, item, link)
+				problems += plan["problems"]
+				if plan["join"]:
+					payload["collectionsToJoin"] = plan["join"]
+				if plan["leave"]:
+					payload["collectionsToLeave"] = plan["leave"]
 
 			# Read Shopify's current status only for a product this app has never considered
 			# publishing -- one created before it did so. Once the decision is recorded, no later
@@ -230,7 +248,27 @@ def push_products(store: str, rows: list[dict]) -> None:
 					publish_to_online_store(client, store, link.product_gid)
 				_mark_publish_decided(store, link.product_gid)
 
+			if plan is not None:
+				# Recorded only after Shopify accepted the move, and only what the app put
+				# there: a collection the merchant added by hand is never ours to remove.
+				record_app_collections(link.name, plan["owned"])
+
+				# Committed before the two calls below, which can fail. Raising afterwards
+				# rolls the transaction back, and that used to take this record with it --
+				# while Shopify kept the collection move it had already accepted. The two
+				# then disagreed, and the next sync could neither re-join nor leave.
+				frappe.db.commit()
+
+				# Both, not one-then-stop. A bad metafield is no reason for the images to
+				# go without their alt text.
+				problems += _push_metafields(client, store_doc, item, link)
+
 			enqueue_media(store, item_code)
+
+			if problems:
+				# Raised after the copy has gone, so one bad metafield does not cost the
+				# product its title. The row carries the reason in plain words.
+				raise ContentError("\n".join(problems))
 		except Exception as exc:
 			# One row's fault is one row's fault. Letting it escape failed every other row in
 			# the claimed group -- including the ones after it, which were never attempted at
@@ -419,6 +457,8 @@ def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) 
 	if options:
 		payload["productOptions"] = options
 
+	payload.update(website_payload(store_doc, item, creating=True))
+
 	data = client.execute(load_query("product_create"), {"product": payload}, cost_hint=15)
 	product = (data.get("productCreate") or {}).get("product") or {}
 	if not product.get("id"):
@@ -454,6 +494,19 @@ def _create_product_unlocked(client: ShopifyClient, store: str, item_code: str) 
 	from shopify_integration.outbound.collections import enqueue_for_item as enqueue_collection
 
 	enqueue_collection(store, item_code)
+
+	# And one more pass over the product itself. The manual collections, the metafields and
+	# the image alt text all need the link -- and, for the alt text, the media -- that only
+	# come into existence on the lines above. The update path already does all three, so it
+	# is given a row rather than having its work duplicated here.
+	if store_doc.get("sync_website_content"):
+		enqueue_sync(
+			store,
+			"product",
+			dedupe_key=f"product:{store}:{item_code}",
+			ref_doctype="Item",
+			ref_docname=item_code,
+		)
 
 	# And its photographs, here rather than only from `push_initial_state`. That runs from
 	# `upsert_link`, which a template never goes through -- its children do -- and asking
@@ -773,6 +826,7 @@ def link_template(store: str, template_item: str, product_gid: str) -> str:
 		link.product_gid = product_gid
 		link.is_template = 1
 		link.is_variant = 0
+		link.origin = "ERPNext"
 		link.insert(ignore_permissions=True)
 		name = link.name
 
@@ -787,7 +841,14 @@ def _link(store: str, item_code: str, product: dict) -> None:
 
 	variants = product.get("variants") or []
 	variant = variants[0] if variants else {}
-	upsert_link(store, item_code=item_code, product=product, variant=variant, is_variant=False)
+	upsert_link(
+		store,
+		item_code=item_code,
+		product=product,
+		variant=variant,
+		is_variant=False,
+		origin="ERPNext",
+	)
 	if _publish_pending.pop(cstr(product.get("id")), False):
 		_mark_publish_decided(store, cstr(product.get("id")))
 
@@ -915,6 +976,7 @@ def _link_variants(store: str, template: str, product: dict, children: list[dict
 			variant=variant,
 			is_variant=True,
 			template_item=template,
+			origin="ERPNext",
 		)
 
 	if _publish_pending.pop(cstr(product.get("id")), False):
@@ -1128,3 +1190,90 @@ def repair_split_template(
 	if apply:
 		frappe.db.commit()
 	return report
+
+
+# --------------------------------------------------------------------------------------
+# Website content, sent alongside the product
+# --------------------------------------------------------------------------------------
+
+
+def _collection_plan(client: ShopifyClient, store_doc, item, link) -> dict:
+	"""Which manual collections to join and leave for this product."""
+	from shopify_integration.outbound.content import collection_plan
+
+	def describe(gids: list[str]) -> dict[str, dict]:
+		if not gids:
+			return {}
+		data = client.execute(
+			load_query("collections_by_id"), {"ids": gids}, cost_hint=5 + len(gids)
+		)
+		found = {}
+		for node in data.get("nodes") or []:
+			if node and node.get("id"):
+				found[cstr(node["id"])] = {
+					"title": cstr(node.get("title")),
+					# A ruleSet is what makes a collection automatic. Shopify decides its
+					# membership from the rules and refuses to be joined to a product.
+					"automatic": bool(node.get("ruleSet")),
+				}
+		return found
+
+	return collection_plan(store_doc, item, link.name, describe)
+
+
+def _push_metafields(client: ShopifyClient, store_doc, item, link) -> list[str]:
+	"""Write the product's metafields, once everything in them is known to be acceptable.
+
+	Validated first and sent only if clean, because `metafieldsSet` is all-or-nothing: one
+	bad taxonomy reference costs the product every other metafield in the call, and the
+	error Shopify returns names none of them.
+	"""
+	wanted = desired_metafields(item)
+	if not wanted:
+		return []
+
+	problems = validate_category_metafields(client, item)
+
+	# Shopify refuses a key it has no definition for, and refuses the whole call with it --
+	# so one unwritable key would cost the product every other metafield in the batch. The
+	# definitions are read first and anything undefined is reported and held back, which
+	# keeps the rest of them going.
+	defined = _defined_metafields(client, {metafield["namespace"] for metafield in wanted})
+	sendable = []
+	for metafield in wanted:
+		pair = (metafield["namespace"], metafield["key"])
+		if pair in defined:
+			sendable.append(metafield)
+		else:
+			problems.append(
+				f"{item.name}: {pair[0]}.{pair[1]} has no metafield definition on this store, "
+				"so Shopify will not accept it. Create the definition first -- the shop's own "
+				"fields are on the Shopify Store form under Create Metafield Definitions."
+			)
+
+	if not sendable:
+		return problems
+
+	payload = [dict(metafield, ownerId=link.product_gid) for metafield in sendable]
+	result = client.execute(
+		load_query("metafields_set"), {"metafields": payload}, cost_hint=10 + len(payload)
+	)
+	errors = (result.get("metafieldsSet") or {}).get("userErrors") or []
+	return problems + [
+		f"{item.name}: metafield {cstr(error.get('field'))} -- {cstr(error.get('message'))}"
+		for error in errors
+	]
+
+
+def _defined_metafields(client: ShopifyClient, namespaces: set[str]) -> set[tuple[str, str]]:
+	"""(namespace, key) for every product metafield this store has defined."""
+	defined: set[tuple[str, str]] = set()
+	for namespace in sorted(namespaces):
+		data = client.execute(
+			load_query("metafield_definitions"), {"namespace": namespace}, cost_hint=10
+		)
+		for node in ((data.get("metafieldDefinitions") or {}).get("nodes") or []):
+			defined.add((cstr(node.get("namespace")), cstr(node.get("key"))))
+	return defined
+
+

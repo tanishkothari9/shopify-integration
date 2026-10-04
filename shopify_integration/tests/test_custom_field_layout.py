@@ -158,7 +158,18 @@ class TestTheDefinitionsThemselves(FrappeTestCase):
 						)
 
 	def test_plain_fields_may_still_choose_their_place(self):
-		"""Item and Customer add no section, so they cannot move anything."""
-		for doctype in ("Item", "Customer"):
+		"""Customer adds no section, so it cannot move anything."""
+		for doctype in ("Customer",):
 			breaks = [f for f in CUSTOM_FIELDS[doctype] if f["fieldtype"] == "Section Break"]
 			self.assertEqual(breaks, [], f"{doctype} should not introduce a section")
+
+	def test_item_introduces_exactly_one_section(self):
+		"""The Website (Shopify) panel, and nothing else.
+
+		One, because a second Section Break inside it would be just as capable of swallowing
+		the rest of the form if the first one ever moved -- and the fields after it are
+		already all ours, so it would buy nothing but that risk.
+		"""
+		breaks = [f for f in CUSTOM_FIELDS["Item"] if f["fieldtype"] == "Section Break"]
+		self.assertEqual([f["fieldname"] for f in breaks], ["shopify_website_section"])
+		self.assertEqual(breaks[0]["insert_after"], END_OF_FORM)
